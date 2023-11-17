@@ -20,12 +20,13 @@ async def crawl(downloader, url: str, *args, **kwargs):
             await crawl(downloader, link, *args, **kwargs)
 
 class TalkbankDataLoader:
-    def __init__(self, tokenizer_name, tokenizer_offset=0, history_secs=20, overlap_secs=5, download_dir=None, force_download=False):
+    def __init__(self, tokenizer_name, tokenizer_offset=0, history_secs=20, overlap_secs=5, drop_last=True, download_dir=None, force_download=False):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.tokenizer_offset = tokenizer_offset
         
         self.history_secs = history_secs
         self.overlap_secs = overlap_secs
+        self.drop_last = drop_last
         self.corpora_urls = {
             "CallFriend_eng_n": "https://media.talkbank.org/ca/CallFriend/eng-n/",
             "CallFriend_eng_s": "https://media.talkbank.org/ca/CallFriend/eng-s/",
@@ -72,6 +73,9 @@ class TalkbankDataLoader:
                 start = 0
                 while True:
                     end = start + self.history_secs * sr
+                    if self.drop_last and end > audio.shape[-1]:
+                        break
+
                     audio_slice = audio[..., start:end]
                     inputs = self.encodec_processor(raw_audio=audio_slice, sampling_rate=sr, return_tensors="pt").to(self.device)
                     encoder_outputs = self.encodec_model.encode(**inputs, bandwidth=1.5).audio_codes # 1 x 1 x n_codebooks x n_tokens
