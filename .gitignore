@@ -166,3 +166,5 @@ data/audio/*
 !data/audio/readme.md
 
 experimental
+persimmon-8b-realtime-codec-agent
+*.wav
