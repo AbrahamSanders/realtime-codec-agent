@@ -8,7 +8,7 @@ python train.py \
     --gradient_accumulation_steps=64 \
     --do_train \
     --bf16 \
-    --output_dir=persimmon-8b-realtime-codec-agent \
+    --output_dir=persimmon-8b-realtime-codec-agent-v2 \
     --do_eval \
     --overwrite_output_dir \
     --seed=42 \
@@ -28,4 +28,5 @@ python train.py \
     --use_peft \
     --peft_lora_r=256 \
     --peft_lora_alpha=16 \
+    --init_audio_embeds_from_encodec \
     --gradient_checkpointing

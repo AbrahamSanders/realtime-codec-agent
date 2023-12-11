@@ -46,6 +46,7 @@ from transformers import (
     MODEL_FOR_CAUSAL_LM_MAPPING,
     AutoConfig,
     AutoModelForCausalLM,
+    EncodecModel,
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
@@ -149,6 +150,18 @@ class ModelArguments:
         default=16,
         metadata={
             "help": "LoRA alpha parameter."
+        }
+    )
+    peft_lora_train_embeds: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to train the token embeddings with LoRA."
+        }
+    )
+    init_audio_embeds_from_encodec: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to initialize audio embeddings from pretrained Encodec codebooks."
         }
     )
     trust_remote_code: bool = field(
@@ -483,6 +496,19 @@ def main():
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
+    if model_args.init_audio_embeds_from_encodec:
+        encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz")
+        with torch.no_grad():
+            cb_size = encodec_model.config.codebook_size
+            cb_dim = encodec_model.config.codebook_dim
+            # copy over the first two codebooks from the Encodec model into the first 2048 tokens of the Persimmon model
+            # TODO: make this more general with tokenizer offset and n_codebooks config options
+            model.model.embed_tokens.weight[:cb_size, :cb_dim] = encodec_model.quantizer.layers[0].codebook.embed.clone()
+            model.model.embed_tokens.weight[:cb_size, cb_dim:] = 0.0
+            model.model.embed_tokens.weight[cb_size:2*cb_size, :cb_dim] = encodec_model.quantizer.layers[1].codebook.embed.clone()
+            model.model.embed_tokens.weight[cb_size:2*cb_size, cb_dim:] = 0.0
+        logger.info("Initialized audio embeddings from Encodec codebooks.")
+
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     if training_args.do_train:
@@ -621,12 +647,15 @@ def main():
 
     # Initialize our Trainer
     if training_args.do_train and model_args.use_peft:
+        #target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"] # Llama2, Mistral
+        target_modules = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h", "lm_head"] # Persimmon
+        if model_args.peft_lora_train_embeds:
+            target_modules.append("embed_tokens")
         peft_config = LoraConfig(
             r=model_args.peft_lora_r,
             lora_alpha=model_args.peft_lora_alpha,
             lora_dropout=0.05,
-            #target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"], # Llama2, Mistral
-            target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h", "embed_tokens", "lm_head"], # Persimmon
+            target_modules=target_modules,
             bias="all",
             task_type="CAUSAL_LM"
         )

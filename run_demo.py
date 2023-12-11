@@ -115,7 +115,7 @@ def generate_audio(context_audio_upload, context_audio_record, seed, decoding, s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the audio generator demo")
-    parser.add_argument("--model", type=str, default="persimmon-8b-realtime-codec-agent/checkpoint-912")
+    parser.add_argument("--model", type=str, default="persimmon-8b-realtime-codec-agent/checkpoint-1824")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
