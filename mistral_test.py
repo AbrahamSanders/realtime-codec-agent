@@ -9,7 +9,7 @@ model = AudioMistralForCausalLM.from_pretrained(model_name, torch_dtype=torch.bf
 
 tokenizer.add_tokens([f"aud{i}" for i in range(2048)], special_tokens=True)
 
-inputs = tokenizer("hello aud0aud1aud2 goodbye").to(device)
+inputs = tokenizer("hello aud0aud1aud2 goodbye", return_tensors="pt").to(device)
 outputs = model(**inputs)
 
 pass

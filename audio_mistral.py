@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple, Union
 from transformers.models.mistral import MistralModel, MistralForCausalLM, MistralConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils import logging
 from torch import nn
@@ -20,8 +20,8 @@ class AudioMistralModel(MistralModel):
         self.register_buffer("audio_embed", audio_embed)
         self.audio_proj = nn.Linear(self.codebook_dim, config.hidden_size, bias=False)
 
-    def embed_audio_tokens(self, input_ids):
-        embeds = nn.functional.embedding(input_ids, self.audio_embed, self.padding_idx)
+    def embed_audio_tokens(self, audio_input_ids):
+        embeds = nn.functional.embedding(audio_input_ids, self.audio_embed, self.padding_idx)
         embeds = self.audio_proj(embeds)
         return embeds
     
@@ -80,13 +80,13 @@ class AudioMistralModel(MistralModel):
             position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
-            inputs_embeds = torch.zeros((batch_size, seq_length, self.config.hidden_size), dtype=self.dtype, device=self.device)
+            inputs_embeds = torch.empty((batch_size, seq_length, self.config.hidden_size), dtype=self.dtype, device=self.device)
             vocab_tokens = input_ids < self.config.vocab_size
             audio_tokens = input_ids >= self.config.vocab_size
             inputs_embeds[vocab_tokens] = self.embed_tokens(input_ids[vocab_tokens])
-            inputs_embeds[audio_tokens] = self.embed_audio_tokens(input_ids[audio_tokens])
+            inputs_embeds[audio_tokens] = self.embed_audio_tokens(input_ids[audio_tokens]-self.config.vocab_size)
 
-        if attention_mask is not None and self._use_flash_attention_2 and use_cache:
+        if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
             is_padding_right = attention_mask[:, -1].sum().item() != batch_size
             if is_padding_right:
                 raise ValueError(
@@ -95,9 +95,18 @@ class AudioMistralModel(MistralModel):
                     " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
                 )
 
-        if self._use_flash_attention_2:
+        if self._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+        elif self._attn_implementation == "sdpa" and not output_attentions:
+            # output_attentions=True can not be supported when using SDPA, and we fall back on
+            # the manual implementation that requires a 4D causal mask in all cases.
+            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                attention_mask,
+                (batch_size, seq_length),
+                inputs_embeds,
+                past_key_values_length,
+            )
         else:
             # 4d mask is passed through the layers
             attention_mask = _prepare_4d_causal_attention_mask(
@@ -168,7 +177,7 @@ class AudioMistralModel(MistralModel):
     
 class AudioMistralForCausalLM(MistralForCausalLM):
     def __init__(self, config):
-        super(super()).__init__(config)
+        super(MistralForCausalLM, self).__init__(config)
         self.model = AudioMistralModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -204,8 +213,8 @@ class AudioMistralForCausalLM(MistralForCausalLM):
         ```python
         >>> from transformers import AutoTokenizer, MistralForCausalLM
 
-        >>> model = MistralForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
-        >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
+        >>> model = MistralForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1")
+        >>> tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
