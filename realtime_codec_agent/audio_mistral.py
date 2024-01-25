@@ -33,7 +33,7 @@ class AudioMistralModel(MistralModel):
     def embed_audio_tokens(self, audio_input_ids):
         audio_input_ids = audio_input_ids - self.config.vocab_size
         embeds = nn.functional.embedding(audio_input_ids, self.audio_embed, self.padding_idx)
-        embeds = self.audio_proj(embeds)
+        embeds = self.audio_proj(embeds).to(embeds.dtype)
         return embeds
     
     def forward(

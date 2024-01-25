@@ -167,4 +167,5 @@ data/audio/*
 
 experimental
 persimmon-8b-realtime-codec-agent*
+Mistral-7B-realtime-codec-agent*
 *.wav
