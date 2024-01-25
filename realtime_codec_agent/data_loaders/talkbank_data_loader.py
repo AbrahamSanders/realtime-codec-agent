@@ -5,6 +5,9 @@ from transformers import EncodecModel, AutoProcessor, AutoTokenizer
 from tqdm import tqdm
 from directory_downloader import DDownloader
 
+from ..utils.encodec_utils import n_codebooks_to_bandwidth_id
+from ..utils.tokenizer_utils import add_special_audio_tokens
+
 # Fix directory_downloader crawl function to accept kwargs supported by get_page_links.
 # The documentation indicates it should work this way but was never implemented in the package.
 async def crawl(downloader, url: str, *args, **kwargs):
@@ -20,10 +23,32 @@ async def crawl(downloader, url: str, *args, **kwargs):
             await crawl(downloader, link, *args, **kwargs)
 
 class TalkbankDataLoader:
-    def __init__(self, tokenizer_name, tokenizer_offset=0, history_secs=20, overlap_secs=5, drop_last=True, download_dir=None, force_download=False):
+    def __init__(self, encodec_modelname, tokenizer_name, use_n_codebooks=2, tokenizer_offset=-1, add_audio_tokens=False, 
+                 history_secs=20, overlap_secs=5, drop_last=True, download_dir=None, force_download=False):
+        
+        # Sanity checks
+        if add_audio_tokens and tokenizer_offset != -1:
+            raise ValueError("Cannot add audio tokens before the end of the tokenizer. Please set tokenizer_offset to -1.")
+
+        # Encodec model
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.encodec_model = EncodecModel.from_pretrained(encodec_modelname).to(self.device)
+        self.encodec_processor = AutoProcessor.from_pretrained(encodec_modelname)
+        self.use_n_codebooks = use_n_codebooks
+        bandwidth_id = n_codebooks_to_bandwidth_id(self.use_n_codebooks)
+        self.encodec_bandwidth = self.encodec_model.config.target_bandwidths[bandwidth_id]
+
+        # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.tokenizer_offset = tokenizer_offset
+        if add_audio_tokens:
+            added_tokens = add_special_audio_tokens(self.tokenizer, self.use_n_codebooks, self.encodec_model.config.codebook_size)
+            print (f"Added {added_tokens} audio tokens to the tokenizer. New tokenizer size: {len(self.tokenizer)}")
+        if self.tokenizer_offset == -1:
+            self.tokenizer_offset = len(self.tokenizer) - self.use_n_codebooks * self.encodec_model.config.codebook_size
+            print(f"Setting tokenizer_offset to {self.tokenizer_offset} (len(tokenizer) - use_n_codebooks * codebook_size).")
         
+        # Data settings
         self.history_secs = history_secs
         self.overlap_secs = overlap_secs
         self.drop_last = drop_last
@@ -37,11 +62,6 @@ class TalkbankDataLoader:
             download_dir = "data/audio/raw"
         self.download_dir = download_dir
         self.force_download = force_download
-
-        # Encodec model
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(self.device)
-        self.encodec_processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
 
     async def load_data(self, corpora="All", group_by_dialogue=False):
         if isinstance(corpora, str):
@@ -78,13 +98,12 @@ class TalkbankDataLoader:
 
                     audio_slice = audio[..., start:end]
                     inputs = self.encodec_processor(raw_audio=audio_slice, sampling_rate=sr, return_tensors="pt").to(self.device)
-                    encoder_outputs = self.encodec_model.encode(**inputs, bandwidth=1.5).audio_codes # 1 x 1 x n_codebooks x n_tokens
+                    encoder_outputs = self.encodec_model.encode(**inputs, bandwidth=self.encodec_bandwidth).audio_codes # 1 x 1 x n_codebooks x n_tokens
 
-                    n_codebooks = encoder_outputs.shape[-2]
-                    audio_codes = torch.zeros(encoder_outputs.shape[-1] * n_codebooks, dtype=encoder_outputs.dtype).to(self.device)
-                    for i in range(n_codebooks):
+                    audio_codes = torch.zeros(encoder_outputs.shape[-1] * self.use_n_codebooks, dtype=encoder_outputs.dtype).to(self.device)
+                    for i in range(self.use_n_codebooks):
                         codebook_offset = i * self.encodec_model.config.codebook_size
-                        audio_codes[i::n_codebooks] = self.tokenizer_offset + codebook_offset + encoder_outputs[0, 0, i]
+                        audio_codes[i::self.use_n_codebooks] = self.tokenizer_offset + codebook_offset + encoder_outputs[0, 0, i]
 
                     example = self.tokenizer.decode(audio_codes, skip_special_tokens=False)
                     if group_by_dialogue:
