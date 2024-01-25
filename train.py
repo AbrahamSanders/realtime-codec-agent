@@ -22,7 +22,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 # -------------------------------------------------------------------------------------------------------------------
-# Adapted from https://github.com/huggingface/transformers/blob/v4.35.2/examples/pytorch/language-modeling/run_clm.py
+# Adapted from https://github.com/huggingface/transformers/blob/v4.37.1/examples/pytorch/language-modeling/run_clm.py
 # Modified for use with a line-by-line text file dataset containing tokenized audio.
 # -------------------------------------------------------------------------------------------------------------------
 
@@ -44,8 +44,8 @@ import transformers
 from transformers import (
     CONFIG_MAPPING,
     MODEL_FOR_CAUSAL_LM_MAPPING,
-    AutoConfig,
-    AutoModelForCausalLM,
+    #AutoConfig,
+    #AutoModelForCausalLM,
     EncodecModel,
     AutoTokenizer,
     HfArgumentParser,
@@ -61,9 +61,12 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from peft import LoraConfig
 
+from realtime_codec_agent.audio_mistral import AudioMistralForCausalLM, AudioMistralConfig
+from realtime_codec_agent.utils.tokenizer_utils import add_special_audio_tokens
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.35.0")
+check_min_version("4.37.0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
@@ -158,10 +161,28 @@ class ModelArguments:
             "help": "Whether to train the token embeddings with LoRA."
         }
     )
-    init_audio_embeds_from_encodec: bool = field(
+    encodec_model: str = field(
+        default="facebook/encodec_24khz",
+        metadata={
+            "help": "The name of the pretrained Encodec model to use."
+        }
+    )
+    use_n_codebooks: int = field(
+        default=2,
+        metadata={
+            "help": "The number of codebooks to use from the Encodec model."
+        }
+    )
+    add_audio_tokens: bool = field(
         default=False,
         metadata={
-            "help": "Whether to initialize audio embeddings from pretrained Encodec codebooks."
+            "help": "Whether to add special audio tokens to the tokenizer."
+        }
+    )
+    freeze_original_model: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to freeze the weights of the original model and just train the new audio-related weights."
         }
     )
     trust_remote_code: bool = field(
@@ -425,24 +446,29 @@ def main():
             )
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
+    # https://huggingface.co/docs/datasets/loading_datasets.
 
     # Load pretrained model and tokenizer
     #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+            
+    encodec_model = EncodecModel.from_pretrained(model_args.encodec_model)
 
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
         "token": model_args.token,
         "trust_remote_code": model_args.trust_remote_code,
+        "num_codebooks": model_args.use_n_codebooks,
+        "codebook_size": encodec_model.config.codebook_size,
+        "codebook_dim": encodec_model.config.codebook_dim,
     }
     if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
+        config = AudioMistralConfig.from_pretrained(model_args.config_name, **config_kwargs)
     elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+        config = AudioMistralConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
@@ -474,7 +500,7 @@ def main():
             if model_args.torch_dtype in ["auto", None]
             else getattr(torch, model_args.torch_dtype)
         )
-        model = AutoModelForCausalLM.from_pretrained(
+        model = AudioMistralForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
@@ -486,28 +512,29 @@ def main():
             low_cpu_mem_usage=model_args.low_cpu_mem_usage,
         )
     else:
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+        model = AudioMistralForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
-    embedding_size = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
+    # # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+    # # on a small vocab and want a smaller embedding size, remove this test.
+    # embedding_size = model.get_input_embeddings().weight.shape[0]
+    # if len(tokenizer) > embedding_size:
+    #     model.resize_token_embeddings(len(tokenizer))
+    
+    if model_args.add_audio_tokens:
+        added_tokens = add_special_audio_tokens(tokenizer, model_args.use_n_codebooks, encodec_model.config.codebook_size)
+        logger.info(f"Added {added_tokens} audio tokens to the tokenizer. New tokenizer size: {len(tokenizer)}")
 
-    if model_args.init_audio_embeds_from_encodec:
-        encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz")
-        with torch.no_grad():
-            cb_size = encodec_model.config.codebook_size
-            cb_dim = encodec_model.config.codebook_dim
-            # copy over the first two codebooks from the Encodec model into the first 2048 tokens of the Persimmon model
-            # TODO: make this more general with tokenizer offset and n_codebooks config options
-            model.model.embed_tokens.weight[:cb_size, :cb_dim] = encodec_model.quantizer.layers[0].codebook.embed.clone()
-            model.model.embed_tokens.weight[:cb_size, cb_dim:] = 0.0
-            model.model.embed_tokens.weight[cb_size:2*cb_size, :cb_dim] = encodec_model.quantizer.layers[1].codebook.embed.clone()
-            model.model.embed_tokens.weight[cb_size:2*cb_size, cb_dim:] = 0.0
-        logger.info("Initialized audio embeddings from Encodec codebooks.")
+    # We don't resize the embedding matrix or LM head of the model because it has a separate audio embedding layer
+    # (projections from fixed encodec codebooks) and a separate audio LM head.
+
+    # copy over the first use_n_codebooks codebooks from the Encodec model into the model's audio_embed matrix
+    with torch.no_grad():
+        cb_size = encodec_model.config.codebook_size
+        for i in range(model_args.use_n_codebooks):
+            model.model.audio_embed[i*cb_size:(i+1)*cb_size] = encodec_model.quantizer.layers[i].codebook.embed.clone()
+    logger.info("Initialized audio embeddings from Encodec codebooks.")
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -523,15 +550,6 @@ def main():
     def tokenize_function(examples):
         with CaptureLogger(tok_logger) as cl:
             output = tokenizer(examples[text_column_name])
-        
-        # remove unneeded tokens that are put at the beginning and end of each audio sequence
-        for i in range(len(output.input_ids)):
-            if tokenizer.convert_ids_to_tokens(output.input_ids[i][1]) == "▁":
-                del output.input_ids[i][1]
-                del output.attention_mask[i][1]
-            if tokenizer.convert_ids_to_tokens(output.input_ids[i][-1]) == "<0x0A>":
-                del output.input_ids[i][-1]
-                del output.attention_mask[i][-1]
 
         # clm input could be much much longer than block_size
         if "Token indices sequence length is longer than the" in cl.out:
@@ -557,15 +575,23 @@ def main():
                 batched=True,
                 remove_columns=column_names,
             )
+    if hasattr(config, "max_position_embeddings"):
+        max_pos_embeddings = config.max_position_embeddings
+    else:
+        # Define a default value if the attribute is missing in the config.
+        max_pos_embeddings = 1024
 
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
-        if block_size > config.max_position_embeddings:
+        if block_size > max_pos_embeddings:
             logger.warning(
                 f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
-                f"Using block_size={min(1024, config.max_position_embeddings)} instead. You can change that default value by passing --block_size xxx."
+                f"Using block_size={min(1024, max_pos_embeddings)} instead. You can change that default value by passing --block_size xxx."
             )
-            block_size = min(1024, config.max_position_embeddings)
+            if max_pos_embeddings > 0:
+                block_size = min(1024, max_pos_embeddings)
+            else:
+                block_size = 1024
     else:
         if data_args.block_size > tokenizer.model_max_length:
             logger.warning(
@@ -635,7 +661,7 @@ def main():
                 logits = logits[0]
             return logits.argmax(dim=-1)
 
-        metric = evaluate.load("accuracy")
+        metric = evaluate.load("accuracy", cache_dir=model_args.cache_dir)
 
         def compute_metrics(eval_preds):
             preds, labels = eval_preds
@@ -647,8 +673,8 @@ def main():
 
     # Initialize our Trainer
     if training_args.do_train and model_args.use_peft:
-        #target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"] # Llama2, Mistral
-        target_modules = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h", "lm_head"] # Persimmon
+        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"] # Llama2, Mistral
+        #target_modules = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h", "lm_head"] # Persimmon
         if model_args.peft_lora_train_embeds:
             target_modules.append("embed_tokens")
         peft_config = LoraConfig(
@@ -660,6 +686,11 @@ def main():
             task_type="CAUSAL_LM"
         )
         model.add_adapter(peft_config)
+    elif training_args.do_train and model_args.freeze_original_model:
+        trainable_params = set(["model.audio_proj.weight", "audio_lm_head.weight"])
+        for name, param in model.named_parameters():
+            if name not in trainable_params:
+                param.requires_grad = False
 
     trainer = Trainer(
         model=model,

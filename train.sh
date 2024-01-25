@@ -1,6 +1,6 @@
 python train.py \
     --log_level info \
-    --model_name_or_path=adept/persimmon-8b-base \
+    --model_name_or_path=mistralai/Mistral-7B-v0.1 \
     --train_file=data/audio/dataset_train.txt \
     --validation_file=data/audio/dataset_dev.txt \
     --per_device_train_batch_size=1 \
@@ -8,7 +8,7 @@ python train.py \
     --gradient_accumulation_steps=64 \
     --do_train \
     --bf16 \
-    --output_dir=persimmon-8b-realtime-codec-agent-v2 \
+    --output_dir=Mistral-7B-realtime-codec-agent \
     --do_eval \
     --overwrite_output_dir \
     --seed=42 \
@@ -25,8 +25,7 @@ python train.py \
     --metric_for_best_model=eval_loss \
     --load_best_model_at_end \
     --dataloader_drop_last \
-    --use_peft \
-    --peft_lora_r=256 \
-    --peft_lora_alpha=16 \
-    --init_audio_embeds_from_encodec \
-    --gradient_checkpointing
+    --encodec_model=facebook/encodec_24khz \
+    --use_n_codebooks=2 \
+    --add_audio_tokens \
+    --freeze_original_model

@@ -10,17 +10,28 @@ import torch
 
 logger = logging.get_logger(__name__)
 
+class AudioMistralConfig(MistralConfig):
+    def __init__(
+        self,
+        num_codebooks=2,
+        codebook_size=1024,
+        codebook_dim=128,
+        **kwargs
+    ):
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
+        self.codebook_dim = codebook_dim
+        super().__init__(**kwargs)
+
 class AudioMistralModel(MistralModel):
-    def __init__(self, config: MistralConfig):
+    def __init__(self, config: AudioMistralConfig):
         super().__init__(config)
-        self.num_codebooks = 2
-        self.codebook_size = 1024
-        self.codebook_dim = 128
-        audio_embed = torch.zeros(self.num_codebooks * self.codebook_size, self.codebook_dim)
+        audio_embed = torch.zeros(config.num_codebooks * config.codebook_size, config.codebook_dim)
         self.register_buffer("audio_embed", audio_embed)
-        self.audio_proj = nn.Linear(self.codebook_dim, config.hidden_size, bias=False)
+        self.audio_proj = nn.Linear(config.codebook_dim, config.hidden_size, bias=False)
 
     def embed_audio_tokens(self, audio_input_ids):
+        audio_input_ids = audio_input_ids - self.config.vocab_size
         embeds = nn.functional.embedding(audio_input_ids, self.audio_embed, self.padding_idx)
         embeds = self.audio_proj(embeds)
         return embeds
@@ -84,7 +95,7 @@ class AudioMistralModel(MistralModel):
             vocab_tokens = input_ids < self.config.vocab_size
             audio_tokens = input_ids >= self.config.vocab_size
             inputs_embeds[vocab_tokens] = self.embed_tokens(input_ids[vocab_tokens])
-            inputs_embeds[audio_tokens] = self.embed_audio_tokens(input_ids[audio_tokens]-self.config.vocab_size)
+            inputs_embeds[audio_tokens] = self.embed_audio_tokens(input_ids[audio_tokens])
 
         if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
             is_padding_right = attention_mask[:, -1].sum().item() != batch_size
@@ -181,7 +192,7 @@ class AudioMistralForCausalLM(MistralForCausalLM):
         self.model = AudioMistralModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.audio_lm_head = nn.Linear(config.hidden_size, self.model.num_codebooks * self.model.codebook_size, bias=False)
+        self.audio_lm_head = nn.Linear(config.hidden_size, config.num_codebooks * config.codebook_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
