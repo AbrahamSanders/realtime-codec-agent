@@ -1,5 +1,6 @@
 from typing import List, Optional, Tuple, Union
 from transformers.models.mistral import MistralModel, MistralForCausalLM, MistralConfig
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer, MistralRMSNorm
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.cache_utils import Cache, DynamicCache
@@ -25,10 +26,23 @@ class AudioMistralConfig(MistralConfig):
 
 class AudioMistralModel(MistralModel):
     def __init__(self, config: AudioMistralConfig):
-        super().__init__(config)
+        super(MistralModel, self).__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         audio_embed = torch.zeros(config.num_codebooks * config.codebook_size, config.codebook_dim)
         self.register_buffer("audio_embed", audio_embed)
         self.audio_proj = nn.Linear(config.codebook_dim, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [MistralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self._attn_implementation = config._attn_implementation
+        self.norm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
 
     def embed_audio_tokens(self, audio_input_ids):
         audio_input_ids = audio_input_ids - self.config.vocab_size
