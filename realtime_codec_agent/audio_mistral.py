@@ -33,7 +33,9 @@ class AudioMistralModel(MistralModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         audio_embed = torch.zeros(config.num_codebooks * config.codebook_size, config.codebook_dim)
         self.register_buffer("audio_embed", audio_embed)
-        self.audio_proj = nn.Linear(config.codebook_dim, config.hidden_size, bias=False)
+        self.audio_projectors = nn.ModuleList(
+            [nn.Linear(config.codebook_dim, config.hidden_size, bias=False) for _ in range(config.num_codebooks)]
+        )
         self.layers = nn.ModuleList(
             [MistralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -47,8 +49,12 @@ class AudioMistralModel(MistralModel):
     def embed_audio_tokens(self, audio_input_ids):
         audio_input_ids = audio_input_ids - self.config.vocab_size
         embeds = nn.functional.embedding(audio_input_ids, self.audio_embed, self.padding_idx)
-        embeds = self.audio_proj(embeds).to(embeds.dtype)
-        return embeds
+        proj_embeds = torch.empty(embeds.shape[:-1] + (self.config.hidden_size,), dtype=embeds.dtype, device=embeds.device)
+        cb_size = self.config.codebook_size
+        for i, audio_proj in enumerate(self.audio_projectors):
+            codebook_tokens = (audio_input_ids >= i*cb_size) & (audio_input_ids < (i+1)*cb_size)
+            proj_embeds[codebook_tokens] = audio_proj(embeds[codebook_tokens]).to(proj_embeds.dtype)
+        return proj_embeds
     
     def forward(
         self,
