@@ -217,6 +217,12 @@ class AudioMistralForCausalLM(MistralForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _compute_loss(self, loss_fct, shift_logits, shift_labels):
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+        return loss
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -286,13 +292,28 @@ class AudioMistralForCausalLM(MistralForCausalLM):
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+
+            loss_fct = CrossEntropyLoss(reduction="sum")
+            loss = torch.zeros(1, dtype=shift_logits.dtype, device=shift_logits.device)
+
+            # Compute loss over vocab tokens separately from the codebook tokens
+            # (i.e., only logits within the vocab will contribute to the loss for the vocab tokens)
+            vocab_tokens = shift_labels < self.config.vocab_size
+            vocab_shift_logits = shift_logits[vocab_tokens][..., :self.config.vocab_size]
+            vocab_shift_labels = shift_labels[vocab_tokens]
+            loss += self._compute_loss(loss_fct, vocab_shift_logits, vocab_shift_labels)
+
+            # Compute loss over tokens of each codebook individually 
+            # (i.e., only logits within each codebook will contribute to the loss for tokens of that codebook)
+            for i in range(self.config.num_codebooks):
+                cb_start = self.config.vocab_size + i*self.config.codebook_size
+                cb_end = self.config.vocab_size + (i+1)*self.config.codebook_size
+                codebook_tokens = (shift_labels >= cb_start) & (shift_labels < cb_end)
+                codebook_shift_logits = shift_logits[codebook_tokens][..., cb_start:cb_end]
+                codebook_shift_labels = shift_labels[codebook_tokens] - cb_start
+                loss += self._compute_loss(loss_fct, codebook_shift_logits, codebook_shift_labels)
+
+            loss /= shift_labels.numel()
 
         if not return_dict:
             output = (logits,) + outputs[1:]

@@ -9,7 +9,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
 config = AudioMistralConfig.from_pretrained(model_name)
-model = AudioMistralForCausalLM.from_pretrained(model_name, config=config, torch_dtype=torch.bfloat16).to(device)
+model = AudioMistralForCausalLM.from_pretrained(model_name, config=config).to(device)
 
 encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz")
 with torch.no_grad():
@@ -21,7 +21,7 @@ add_special_audio_tokens(tokenizer, config.num_codebooks, config.codebook_size)
 
 inputs = tokenizer(["hello <c0t0000><c1t0000><c0t0001><c1t0001> goodbye",
                     "hello <c0t1022><c1t1022><c0t1023><c1t1023> goodbye"], return_tensors="pt", padding=True).to(device)
-outputs = model(**inputs)
+outputs = model(**inputs, labels=inputs.input_ids)
 
 pass
 
