@@ -8,7 +8,7 @@ python train.py \
     --gradient_accumulation_steps=64 \
     --do_train \
     --bf16 \
-    --output_dir=Mistral-7B-realtime-codec-agent-2 \
+    --output_dir=Mistral-7B-realtime-codec-agent-3 \
     --do_eval \
     --overwrite_output_dir \
     --seed=42 \

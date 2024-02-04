@@ -294,14 +294,15 @@ class AudioMistralForCausalLM(MistralForCausalLM):
             shift_labels = labels[..., 1:].contiguous()
 
             loss_fct = CrossEntropyLoss(reduction="sum")
-            loss = torch.zeros(1, dtype=shift_logits.dtype, device=shift_logits.device)
+            loss = torch.tensor(0., dtype=shift_logits.dtype, device=shift_logits.device)
 
             # Compute loss over vocab tokens separately from the codebook tokens
             # (i.e., only logits within the vocab will contribute to the loss for the vocab tokens)
             vocab_tokens = shift_labels < self.config.vocab_size
-            vocab_shift_logits = shift_logits[vocab_tokens][..., :self.config.vocab_size]
-            vocab_shift_labels = shift_labels[vocab_tokens]
-            loss += self._compute_loss(loss_fct, vocab_shift_logits, vocab_shift_labels)
+            if vocab_tokens.any():
+                vocab_shift_logits = shift_logits[vocab_tokens][..., :self.config.vocab_size]
+                vocab_shift_labels = shift_labels[vocab_tokens]
+                loss += self._compute_loss(loss_fct, vocab_shift_logits, vocab_shift_labels)
 
             # Compute loss over tokens of each codebook individually 
             # (i.e., only logits within each codebook will contribute to the loss for tokens of that codebook)
@@ -309,9 +310,10 @@ class AudioMistralForCausalLM(MistralForCausalLM):
                 cb_start = self.config.vocab_size + i*self.config.codebook_size
                 cb_end = self.config.vocab_size + (i+1)*self.config.codebook_size
                 codebook_tokens = (shift_labels >= cb_start) & (shift_labels < cb_end)
-                codebook_shift_logits = shift_logits[codebook_tokens][..., cb_start:cb_end]
-                codebook_shift_labels = shift_labels[codebook_tokens] - cb_start
-                loss += self._compute_loss(loss_fct, codebook_shift_logits, codebook_shift_labels)
+                if codebook_tokens.any():
+                    codebook_shift_logits = shift_logits[codebook_tokens][..., cb_start:cb_end]
+                    codebook_shift_labels = shift_labels[codebook_tokens] - cb_start
+                    loss += self._compute_loss(loss_fct, codebook_shift_logits, codebook_shift_labels)
 
             loss /= shift_labels.numel()
 
