@@ -73,8 +73,7 @@ def detokenize_audio(tokens, n_codebooks, tokenizer_offset):
     sr = encodec_model.config.sampling_rate
     return (sr, output_audio_encodec.cpu().numpy()), (sr, output_audio_vocos.cpu().numpy())
 
-def generate_audio(context_audio_upload, context_audio_record, seed, decoding, seconds, temperature, num_beams, 
-                    top_k, top_p, typical_p, penalty_alpha):
+def generate_audio(context_audio, seed, decoding, seconds, temperature, num_beams, top_k, top_p, typical_p, penalty_alpha):
     use_n_codebooks = 2
     tokenizer_offset = len(tokenizer) - use_n_codebooks * encodec_model.config.codebook_size
 
@@ -97,7 +96,6 @@ def generate_audio(context_audio_upload, context_audio_record, seed, decoding, s
     if seed:
         set_seed(int(seed))
 
-    context_audio = context_audio_upload if context_audio_upload is not None else context_audio_record
     model_inputs = tokenize_audio(context_audio, use_n_codebooks, tokenizer_offset)
     altCodebooksLogitsProc = AlternatingCodebooksLogitsProcessor(
         input_start_len = model_inputs["input_ids"].shape[-1],
@@ -111,7 +109,7 @@ def generate_audio(context_audio_upload, context_audio_record, seed, decoding, s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the audio generator demo")
-    parser.add_argument("--model", type=str, default="Mistral-7B-realtime-codec-agent/checkpoint-1824")
+    parser.add_argument("--model", type=str, default="Mistral-7B-realtime-codec-agent-2/checkpoint-1824")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -126,12 +124,11 @@ if __name__ == "__main__":
     interface = gr.Interface(
         fn=generate_audio,
         inputs=[
-            gr.Audio(label="Context (Upload)"),
-            gr.Audio(label="Context (Record)", source="microphone"),
+            gr.Audio(label="Context"),
             gr.Textbox(label="Random seed", value="42"),
             gr.Radio(["Greedy", "Sampling", "Contrastive"], value="Sampling", label="Decoding"),
             gr.Slider(1, 20, value=2, step=1, label="Seconds"),
-            gr.Slider(0.1, 10.0, value=1.0, step=0.1, label="Temperature"),
+            gr.Slider(0.1, 10.0, value=1.0, step=0.01, label="Temperature"),
             gr.Slider(1, 10, value=1, step=1, label="Beams"),
             gr.Slider(0, 100, value=0, step=1, label="Top-k"),
             gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Top-p"),
