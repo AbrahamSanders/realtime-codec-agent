@@ -9,6 +9,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
 config = AudioMistralConfig.from_pretrained(model_name)
+config.isolate_codebook_loss = True
 model = AudioMistralForCausalLM.from_pretrained(model_name, config=config).to(device)
 
 encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz")

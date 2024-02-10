@@ -17,11 +17,13 @@ class AudioMistralConfig(MistralConfig):
         num_codebooks=2,
         codebook_size=1024,
         codebook_dim=128,
+        isolate_codebook_loss=False,
         **kwargs
     ):
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
         self.codebook_dim = codebook_dim
+        self.isolate_codebook_loss = isolate_codebook_loss
         super().__init__(**kwargs)
 
 class AudioMistralModel(MistralModel):
@@ -214,6 +216,12 @@ class AudioMistralForCausalLM(MistralForCausalLM):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.audio_lm_head = nn.Linear(config.hidden_size, config.num_codebooks * config.codebook_size, bias=False)
 
+        self.vocab_splits = [(0, self.config.vocab_size)]
+        for i in range(config.num_codebooks):
+            cb_start = config.vocab_size + i*config.codebook_size
+            cb_end = config.vocab_size + (i+1)*config.codebook_size
+            self.vocab_splits.append((cb_start, cb_end))
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -293,29 +301,24 @@ class AudioMistralForCausalLM(MistralForCausalLM):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            loss_fct = CrossEntropyLoss(reduction="sum")
-            loss = torch.tensor(0., dtype=shift_logits.dtype, device=shift_logits.device)
-
-            # Compute loss over vocab tokens separately from the codebook tokens
-            # (i.e., only logits within the vocab will contribute to the loss for the vocab tokens)
-            vocab_tokens = shift_labels < self.config.vocab_size
-            if vocab_tokens.any():
-                vocab_shift_logits = shift_logits[vocab_tokens][..., :self.config.vocab_size]
-                vocab_shift_labels = shift_labels[vocab_tokens]
-                loss += self._compute_loss(loss_fct, vocab_shift_logits, vocab_shift_labels)
-
-            # Compute loss over tokens of each codebook individually 
-            # (i.e., only logits within each codebook will contribute to the loss for tokens of that codebook)
-            for i in range(self.config.num_codebooks):
-                cb_start = self.config.vocab_size + i*self.config.codebook_size
-                cb_end = self.config.vocab_size + (i+1)*self.config.codebook_size
-                codebook_tokens = (shift_labels >= cb_start) & (shift_labels < cb_end)
-                if codebook_tokens.any():
-                    codebook_shift_logits = shift_logits[codebook_tokens][..., cb_start:cb_end]
-                    codebook_shift_labels = shift_labels[codebook_tokens] - cb_start
-                    loss += self._compute_loss(loss_fct, codebook_shift_logits, codebook_shift_labels)
-
-            loss /= shift_labels.numel()
+            if self.config.isolate_codebook_loss:
+                loss_fct = CrossEntropyLoss(reduction="sum")
+                loss = torch.tensor(0., dtype=shift_logits.dtype, device=shift_logits.device)
+                # Compute loss over tokens of each vocab split (e.g., text tokens, distinct codebook tokens) individually 
+                # (i.e., only logits within each split will contribute to the loss for tokens of that split)
+                for start, end in self.vocab_splits:
+                    split_tokens = (shift_labels >= start) & (shift_labels < end)
+                    if split_tokens.any():
+                        split_shift_logits = shift_logits[split_tokens][..., start:end]
+                        split_shift_labels = shift_labels[split_tokens] - start
+                        loss += self._compute_loss(loss_fct, split_shift_logits, split_shift_labels)
+                loss /= shift_labels.numel()
+            else:
+                loss_fct = CrossEntropyLoss()
+                # Flatten the tokens
+                shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
+                shift_labels = shift_labels.view(-1)
+                loss = self._compute_loss(loss_fct, shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
