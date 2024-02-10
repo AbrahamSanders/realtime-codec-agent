@@ -22,7 +22,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 # -------------------------------------------------------------------------------------------------------------------
-# Adapted from https://github.com/huggingface/transformers/blob/v4.37.1/examples/pytorch/language-modeling/run_clm.py
+# Adapted from https://github.com/huggingface/transformers/blob/v4.37.2/examples/pytorch/language-modeling/run_clm.py
 # Modified for use with a line-by-line text file dataset containing tokenized audio.
 # -------------------------------------------------------------------------------------------------------------------
 
@@ -62,6 +62,7 @@ from transformers.utils.versions import require_version
 from peft import LoraConfig
 
 from realtime_codec_agent.audio_mistral import AudioMistralForCausalLM, AudioMistralConfig
+from realtime_codec_agent.audio_qwen2 import AudioQwen2ForCausalLM, AudioQwen2Config
 from realtime_codec_agent.utils.tokenizer_utils import add_special_audio_tokens
 
 
@@ -76,6 +77,14 @@ logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+def get_model_and_config_class(model_name):
+    model_name = model_name.lower()
+    if "mistral" in model_name:
+        return AudioMistralForCausalLM, AudioMistralConfig
+    elif "qwen" in model_name:
+        return AudioQwen2ForCausalLM, AudioQwen2Config
+    else:
+        raise ValueError(f"Model type for {model_name} not recognized")
 
 @dataclass
 class ModelArguments:
@@ -171,6 +180,12 @@ class ModelArguments:
         default=2,
         metadata={
             "help": "The number of codebooks to use from the Encodec model."
+        }
+    )
+    isolate_codebook_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to split the vocab by modality (text, individual codebooks) and compute loss for each split individually."
         }
     )
     add_audio_tokens: bool = field(
@@ -455,6 +470,10 @@ def main():
     # download model & vocab.
             
     encodec_model = EncodecModel.from_pretrained(model_args.encodec_model)
+    
+    model_cls, config_cls = get_model_and_config_class(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path
+    )
 
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -464,11 +483,12 @@ def main():
         "num_codebooks": model_args.use_n_codebooks,
         "codebook_size": encodec_model.config.codebook_size,
         "codebook_dim": encodec_model.config.codebook_dim,
+        "isolate_codebook_loss": model_args.isolate_codebook_loss,
     }
     if model_args.config_name:
-        config = AudioMistralConfig.from_pretrained(model_args.config_name, **config_kwargs)
+        config = config_cls.from_pretrained(model_args.config_name, **config_kwargs)
     elif model_args.model_name_or_path:
-        config = AudioMistralConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+        config = config_cls.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
@@ -500,7 +520,7 @@ def main():
             if model_args.torch_dtype in ["auto", None]
             else getattr(torch, model_args.torch_dtype)
         )
-        model = AudioMistralForCausalLM.from_pretrained(
+        model = model_cls.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
@@ -512,7 +532,7 @@ def main():
             low_cpu_mem_usage=model_args.low_cpu_mem_usage,
         )
     else:
-        model = AudioMistralForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+        model = model_cls.from_config(config, trust_remote_code=model_args.trust_remote_code)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
@@ -659,6 +679,18 @@ def main():
                 # Depending on the model and config, logits may contain extra tensors,
                 # like past_key_values, but logits always come first
                 logits = logits[0]
+                
+            if model_args.isolate_codebook_loss:
+                shift_logits = logits[..., :-1, :]
+                shift_labels = labels[..., 1:]
+                for start, end in model.vocab_splits:
+                    split_tokens = (shift_labels >= start) & (shift_labels < end)
+                    if split_tokens.any():
+                        split_shift_logits = shift_logits[split_tokens]
+                        split_shift_logits[..., :start] = -float("inf")
+                        split_shift_logits[..., end:] = -float("inf")
+                        shift_logits[split_tokens] = split_shift_logits
+
             return logits.argmax(dim=-1)
 
         metric = evaluate.load("accuracy", cache_dir=model_args.cache_dir)
@@ -673,7 +705,7 @@ def main():
 
     # Initialize our Trainer
     if training_args.do_train and model_args.use_peft:
-        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"] # Llama2, Mistral
+        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"] # Llama2, Mistral, Qwen2
         #target_modules = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h", "lm_head"] # Persimmon
         if model_args.peft_lora_train_embeds:
             target_modules.append("embed_tokens")
