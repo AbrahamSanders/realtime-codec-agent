@@ -12,6 +12,7 @@ import librosa
 from vocos import Vocos
 
 from realtime_codec_agent.audio_mistral import AudioMistralForCausalLM
+from realtime_codec_agent.audio_qwen2 import AudioQwen2ForCausalLM
 from transformers.generation import AlternatingCodebooksLogitsProcessor
 from realtime_codec_agent.utils.encodec_utils import n_codebooks_to_bandwidth_id
 
@@ -22,6 +23,15 @@ model = None
 encodec_model = None
 encodec_processor = None
 vocos = None
+
+def get_model_class(model_name):
+    model_name = model_name.lower()
+    if "mistral" in model_name:
+        return AudioMistralForCausalLM
+    elif "qwen" in model_name:
+        return AudioQwen2ForCausalLM
+    else:
+        raise ValueError(f"Model type for {model_name} not recognized")
 
 def tokenize_audio(audio, use_n_codebooks, tokenizer_offset):
     orig_sr, audio = audio
@@ -40,11 +50,13 @@ def tokenize_audio(audio, use_n_codebooks, tokenizer_offset):
     encoder_outputs = encodec_model.encode(**inputs, bandwidth=bandwidth).audio_codes # 1 x 1 x n_codebooks x n_tokens
 
     # convert to sequence of alternating tokens
-    audio_codes = torch.zeros(encoder_outputs.shape[-1] * use_n_codebooks + 1, dtype=encoder_outputs.dtype).to(device)
-    audio_codes[0] = tokenizer.bos_token_id
+    bos_offset = 1 if tokenizer.bos_token_id is not None else 0
+    audio_codes = torch.zeros(encoder_outputs.shape[-1] * use_n_codebooks + bos_offset, dtype=encoder_outputs.dtype).to(device)
+    if bos_offset:
+        audio_codes[0] = tokenizer.bos_token_id
     for i in range(use_n_codebooks):
         codebook_offset = i * encodec_model.config.codebook_size
-        audio_codes[1:][i::use_n_codebooks] = tokenizer_offset + codebook_offset + encoder_outputs[0, 0, i]
+        audio_codes[bos_offset:][i::use_n_codebooks] = tokenizer_offset + codebook_offset + encoder_outputs[0, 0, i]
 
     # return as model inputs
     audio_codes = audio_codes.unsqueeze(0)
@@ -53,10 +65,11 @@ def tokenize_audio(audio, use_n_codebooks, tokenizer_offset):
 
 def detokenize_audio(tokens, n_codebooks, tokenizer_offset):
     # convert sequence of alternating tokens to audio codes
-    audio_codes = torch.zeros((n_codebooks, (tokens.shape[-1] - 1) // n_codebooks), dtype=tokens.dtype).to(device)
+    bos_offset = 1 if tokenizer.bos_token_id is not None else 0
+    audio_codes = torch.zeros((n_codebooks, (tokens.shape[-1] - bos_offset) // n_codebooks), dtype=tokens.dtype).to(device)
     for i in range(n_codebooks):
         codebook_offset = i * encodec_model.config.codebook_size
-        audio_codes[i] = tokens[0, 1:][i::n_codebooks] - codebook_offset - tokenizer_offset
+        audio_codes[i] = tokens[0, bos_offset:][i::n_codebooks] - codebook_offset - tokenizer_offset
     
     # decode audio codes with encodec
     with torch.no_grad():
@@ -109,12 +122,15 @@ def generate_audio(context_audio, seed, decoding, seconds, temperature, num_beam
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the audio generator demo")
-    parser.add_argument("--model", type=str, default="Mistral-7B-realtime-codec-agent-2/checkpoint-1824")
+    parser.add_argument("--model", type=str, default="Qwen1.5-1.8B-realtime-codec-agent/checkpoint-1824")
     args = parser.parse_args()
+
+    print(f"Running with args: {args}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AudioMistralForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16).to(device)
+    model_cls = get_model_class(args.model)
+    model = model_cls.from_pretrained(args.model, torch_dtype=torch.float16).to(device)
 
     encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
     encodec_processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
