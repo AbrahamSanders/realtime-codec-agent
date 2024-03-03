@@ -164,8 +164,14 @@ cython_debug/
 
 data/audio/*
 !data/audio/readme.md
+data/transcripts/*
+!data/transcripts/readme.md
 
 experimental
-persimmon-8b-realtime-codec-agent*
-Mistral-7B-realtime-codec-agent*
+persimmon-*-realtime-codec-agent*
+Mistral-*-realtime-codec-agent*
+Qwen1.5-*-realtime-codec-agent*
 *.wav
+*.mp3
+*.sph
+sph2pipe

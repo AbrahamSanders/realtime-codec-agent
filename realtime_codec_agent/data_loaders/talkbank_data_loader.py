@@ -56,7 +56,9 @@ class TalkbankDataLoader:
             "CallFriend_eng_n": "https://media.talkbank.org/ca/CallFriend/eng-n/",
             "CallFriend_eng_s": "https://media.talkbank.org/ca/CallFriend/eng-s/",
             "CallHome_eng": "https://media.talkbank.org/ca/CallHome/eng/",
-            "SBCSAE": "https://media.talkbank.org/ca/SBCSAE/"
+            "SBCSAE": "https://media.talkbank.org/ca/SBCSAE/",
+            "fisher_eng_tr_sp_LDC2004S13": None, # Fisher English Training Speech Part 1
+            "fe_03_p2_LDC2005S13": None # Fisher English Training Speech Part 2
         }
         if download_dir is None:
             download_dir = "data/audio/raw"
@@ -80,12 +82,17 @@ class TalkbankDataLoader:
             corpus_path = os.path.join(self.download_dir, corpus)
             if not os.path.exists(corpus_path) or self.force_download:
                 corpus_url = self.corpora_urls[corpus]
+                if corpus_url is None:
+                    raise ValueError(f"Corpus '{corpus}' is not available for download.")
                 downloader = DDownloader()
                 await crawl(downloader, corpus_url, extensions=[".mp3"])
                 await downloader.download_files(full_directory=corpus_path)
 
-            for audio_file in tqdm(os.listdir(corpus_path), desc="Files"):
-                audio_file = os.path.join(corpus_path, audio_file)
+            audio_files = []
+            for root, _, files in os.walk(corpus_path):
+                audio_files.extend([os.path.join(root, file) for file in files if file.endswith(".mp3")])
+            audio_files.sort()
+            for audio_file in tqdm(audio_files, desc="Files"):
                 audio, sr = librosa.load(audio_file, sr=self.encodec_model.config.sampling_rate, mono=True)
 
                 if group_by_dialogue:
