@@ -1,7 +1,7 @@
 import os
 import librosa
 import torch
-from transformers import EncodecModel, AutoProcessor, AutoTokenizer
+from transformers import EncodecModel, AutoProcessor, AutoTokenizer, AutoConfig
 from tqdm import tqdm
 from directory_downloader import DDownloader
 
@@ -42,7 +42,8 @@ class TalkbankDataLoader:
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.tokenizer_offset = tokenizer_offset
         if add_audio_tokens:
-            added_tokens = add_special_audio_tokens(self.tokenizer, self.use_n_codebooks, self.encodec_model.config.codebook_size)
+            config = AutoConfig.from_pretrained(tokenizer_name)
+            added_tokens = add_special_audio_tokens(self.tokenizer, config.vocab_size, self.use_n_codebooks, self.encodec_model.config.codebook_size)
             print (f"Added {added_tokens} audio tokens to the tokenizer. New tokenizer size: {len(self.tokenizer)}")
         if self.tokenizer_offset == -1:
             self.tokenizer_offset = len(self.tokenizer) - self.use_n_codebooks * self.encodec_model.config.codebook_size

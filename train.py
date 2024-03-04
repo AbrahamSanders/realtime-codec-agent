@@ -543,7 +543,9 @@ def main():
     #     model.resize_token_embeddings(len(tokenizer))
     
     if model_args.add_audio_tokens:
-        added_tokens = add_special_audio_tokens(tokenizer, model_args.use_n_codebooks, encodec_model.config.codebook_size)
+        added_tokens = add_special_audio_tokens(
+            tokenizer, config.vocab_size, model_args.use_n_codebooks, encodec_model.config.codebook_size
+        )
         logger.info(f"Added {added_tokens} audio tokens to the tokenizer. New tokenizer size: {len(tokenizer)}")
 
     # We don't resize the embedding matrix or LM head of the model because it has a separate audio embedding layer
