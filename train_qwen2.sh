@@ -1,0 +1,30 @@
+python train.py \
+    --log_level info \
+    --model_name_or_path=Qwen/Qwen1.5-1.8B \
+    --train_file=data/audio/dataset_train.txt \
+    --validation_file=data/audio/dataset_dev.txt \
+    --per_device_train_batch_size=2 \
+    --per_device_eval_batch_size=2 \
+    --gradient_accumulation_steps=32 \
+    --do_train \
+    --bf16 \
+    --output_dir=Qwen1.5-1.8B-realtime-codec-agent \
+    --do_eval \
+    --overwrite_output_dir \
+    --seed=42 \
+    --data_seed=42 \
+    --eval_steps=228 \
+    --logging_steps=4 \
+    --save_total_limit=3 \
+    --evaluation_strategy=steps \
+    --lr_scheduler_type=cosine \
+    --num_train_epochs=12 \
+    --save_steps=228 \
+    --learning_rate=5e-05 \
+    --warmup_ratio=0.03 \
+    --metric_for_best_model=eval_loss \
+    --load_best_model_at_end \
+    --dataloader_drop_last \
+    --encodec_model=facebook/encodec_24khz \
+    --use_n_codebooks=2 \
+    --add_audio_tokens
