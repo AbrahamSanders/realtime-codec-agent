@@ -22,7 +22,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 # -------------------------------------------------------------------------------------------------------------------
-# Adapted from https://github.com/huggingface/transformers/blob/v4.37.2/examples/pytorch/language-modeling/run_clm.py
+# Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/examples/pytorch/language-modeling/run_clm.py
 # Modified for use with a line-by-line text file dataset containing tokenized audio.
 # -------------------------------------------------------------------------------------------------------------------
 
@@ -67,7 +67,7 @@ from realtime_codec_agent.utils.tokenizer_utils import add_special_audio_tokens
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.37.0")
+check_min_version("4.38.0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
@@ -204,7 +204,7 @@ class ModelArguments:
         default=False,
         metadata={
             "help": (
-                "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option"
+                "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option "
                 "should only be set to `True` for repositories you trust and in which you have read the code, as it will "
                 "execute code present on the Hub on your local machine."
             )
@@ -572,7 +572,6 @@ def main():
     def tokenize_function(examples):
         with CaptureLogger(tok_logger) as cl:
             output = tokenizer(examples[text_column_name])
-
         # clm input could be much much longer than block_size
         if "Token indices sequence length is longer than the" in cl.out:
             tok_logger.warning(
