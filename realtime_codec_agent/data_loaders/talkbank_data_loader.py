@@ -122,4 +122,4 @@ class TalkbankDataLoader:
                         break
                     start = end - self.overlap_secs * sr
                 if group_by_dialogue and len(dialogue) > 0:
-                    yield dialogue
+                    yield audio_file, dialogue

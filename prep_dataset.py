@@ -11,8 +11,8 @@ async def main():
     parser.add_argument("--data-dir", default="data/audio")
     parser.add_argument("--corpora", default="All")
     parser.add_argument("--force-download", action="store_true")
-    parser.add_argument("--test-proportion", type=float, default=0.1)
-    parser.add_argument("--dev-proportion", type=float, default=0.1)
+    parser.add_argument("--test-proportion", type=float, default=0.01)
+    parser.add_argument("--dev-proportion", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--debug-num-files", type=int, default=-1)
     parser.add_argument("--encodec-model", default="facebook/encodec_24khz")
@@ -32,21 +32,32 @@ async def main():
         download_dir=os.path.join(args.data_dir, "raw"), 
         force_download=args.force_download
     )
-    num_files = 0
-    async for dialogue in loader.load_data(corpora=args.corpora, group_by_dialogue=True):
-        dialogue_filename = os.path.join(args.data_dir, f"dialogue_{num_files}.txt")
+    audio_files = []
+    async for audio_file, dialogue in loader.load_data(corpora=args.corpora, group_by_dialogue=True):
+        dialogue_filename = os.path.join(args.data_dir, f"dialogue_{len(audio_files)}.txt")
         with open(dialogue_filename, "w", encoding="utf-8") as f:
             for example in dialogue:
                 f.write(example)
                 f.write("\n")
-        num_files += 1
-        if args.debug_num_files > 0 and num_files == args.debug_num_files:
+        audio_files.append(os.path.relpath(audio_file, loader.download_dir))
+        if args.debug_num_files > 0 and len(audio_files) == args.debug_num_files:
             break
+
+    audio_files = np.array(audio_files)
     
-    train_dialogues, test_dialogues = train_test_split(np.arange(num_files), test_size=args.test_proportion, random_state=args.seed)
-    train_dialogues, dev_dialogues = train_test_split(train_dialogues, test_size=args.dev_proportion, random_state=args.seed)
+    dev_test_proportion = args.dev_proportion + args.test_proportion
+    train_dialogues, test_dialogues = train_test_split(np.arange(len(audio_files)), test_size=dev_test_proportion, random_state=args.seed)
+    test_proportion = args.test_proportion / dev_test_proportion
+    dev_dialogues, test_dialogues = train_test_split(test_dialogues, test_size=test_proportion, random_state=args.seed)
 
     for split, split_dialogues in zip(("train", "dev", "test"), (train_dialogues, dev_dialogues, test_dialogues)):
+        output_filename = os.path.join(args.data_dir, f"sources_{split}.txt")
+        split_audio_files = sorted(audio_files[split_dialogues].tolist())
+        with open(output_filename, "w", encoding="utf-8") as f:
+            for audio_file in split_audio_files:
+                f.write(audio_file)
+                f.write("\n")
+
         output_filename = os.path.join(args.data_dir, f"dataset_{split}.txt")
         with open(output_filename, "w", encoding="utf-8") as f:
             for dialogue in split_dialogues:
