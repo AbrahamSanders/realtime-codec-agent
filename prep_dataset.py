@@ -32,40 +32,42 @@ async def main():
         download_dir=os.path.join(args.data_dir, "raw"), 
         force_download=args.force_download
     )
-    audio_files = []
+    num_files = 0
     async for audio_file, dialogue in loader.load_data(corpora=args.corpora, group_by_dialogue=True):
-        dialogue_filename = os.path.join(args.data_dir, f"dialogue_{len(audio_files)}.txt")
+        dialogue_filename = os.path.join(args.data_dir, f"dialogue_{num_files}.txt")
         with open(dialogue_filename, "w", encoding="utf-8") as f:
+            f.write(os.path.relpath(audio_file, loader.download_dir))
+            f.write("\n")
             for example in dialogue:
                 f.write(example)
                 f.write("\n")
-        audio_files.append(os.path.relpath(audio_file, loader.download_dir))
-        if args.debug_num_files > 0 and len(audio_files) == args.debug_num_files:
+        num_files += 1
+        if args.debug_num_files > 0 and num_files == args.debug_num_files:
             break
-
-    audio_files = np.array(audio_files)
     
     dev_test_proportion = args.dev_proportion + args.test_proportion
-    train_dialogues, test_dialogues = train_test_split(np.arange(len(audio_files)), test_size=dev_test_proportion, random_state=args.seed)
+    train_dialogues, test_dialogues = train_test_split(np.arange(num_files), test_size=dev_test_proportion, random_state=args.seed)
     test_proportion = args.test_proportion / dev_test_proportion
     dev_dialogues, test_dialogues = train_test_split(test_dialogues, test_size=test_proportion, random_state=args.seed)
 
-    for split, split_dialogues in zip(("train", "dev", "test"), (train_dialogues, dev_dialogues, test_dialogues)):
-        output_filename = os.path.join(args.data_dir, f"sources_{split}.txt")
-        split_audio_files = sorted(audio_files[split_dialogues].tolist())
-        with open(output_filename, "w", encoding="utf-8") as f:
-            for audio_file in split_audio_files:
-                f.write(audio_file)
-                f.write("\n")
+    train_dialogues.sort()
+    dev_dialogues.sort()
+    test_dialogues.sort()
 
-        output_filename = os.path.join(args.data_dir, f"dataset_{split}.txt")
-        with open(output_filename, "w", encoding="utf-8") as f:
-            for dialogue in split_dialogues:
-                dialogue_filename = os.path.join(args.data_dir, f"dialogue_{dialogue}.txt")
-                with open(dialogue_filename, "r", encoding="utf-8") as df:
-                    for example in df:
-                        f.write(example)
-                os.remove(dialogue_filename)
+    for split, split_dialogues in zip(("train", "dev", "test"), (train_dialogues, dev_dialogues, test_dialogues)):
+        sources_output_filename = os.path.join(args.data_dir, f"sources_{split}.txt")
+        dataset_output_filename = os.path.join(args.data_dir, f"dataset_{split}.txt")
+        with open(sources_output_filename, "w", encoding="utf-8") as f_sources:
+            with open(dataset_output_filename, "w", encoding="utf-8") as f_dataset:
+                for dialogue in split_dialogues:
+                    dialogue_filename = os.path.join(args.data_dir, f"dialogue_{dialogue}.txt")
+                    with open(dialogue_filename, "r", encoding="utf-8") as f_dialogue:
+                        for i, example in enumerate(f_dialogue):
+                            if i == 0:
+                                f_sources.write(example)
+                            else:
+                                f_dataset.write(example)
+                    os.remove(dialogue_filename)
     
 if __name__ == "__main__":
     asyncio.run(main())
