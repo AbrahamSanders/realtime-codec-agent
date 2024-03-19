@@ -2,7 +2,8 @@ from transformers import (
     #AutoModelForCausalLM, 
     AutoTokenizer, 
     EncodecModel, 
-    AutoProcessor
+    AutoProcessor,
+    SinkCache
 )
 from transformers.trainer_utils import set_seed
 import torch
@@ -86,7 +87,21 @@ def detokenize_audio(tokens, n_codebooks, tokenizer_offset):
     sr = encodec_model.config.sampling_rate
     return (sr, output_audio_encodec.cpu().numpy()), (sr, output_audio_vocos.cpu().numpy())
 
-def generate_audio(context_audio, seed, decoding, seconds, temperature, num_beams, top_k, top_p, typical_p, penalty_alpha):
+def generate_audio(
+        context_audio, 
+        seed, 
+        use_sink_cache, 
+        num_sink_tokens, 
+        window_length_seconds, 
+        decoding, 
+        seconds, 
+        temperature, 
+        num_beams, 
+        top_k, 
+        top_p, 
+        typical_p, 
+        penalty_alpha
+    ):
     use_n_codebooks = 2
     tokenizer_offset = len(tokenizer) - use_n_codebooks * encodec_model.config.codebook_size
 
@@ -115,14 +130,22 @@ def generate_audio(context_audio, seed, decoding, seconds, temperature, num_beam
         semantic_vocab_size = tokenizer_offset,
         codebook_size = encodec_model.config.codebook_size
     )
+    if use_sink_cache:
+        window_length = int(window_length_seconds) * use_n_codebooks * 75
+        print (f"Using SinkCache with window_length={window_length} and num_sink_tokens={num_sink_tokens}.")
+        cache = SinkCache(window_length=window_length, num_sink_tokens=num_sink_tokens)
+        generate_kwargs["past_key_values"] = cache
+        generate_kwargs["use_cache"] = True
     model_outputs = model.generate(**model_inputs, **generate_kwargs, logits_processor=[altCodebooksLogitsProc])
+    if use_sink_cache:
+        print(f"key_cache: {cache.key_cache[0].shape}\nvalue_cache: {cache.value_cache[0].shape};\nseen_tokens: {cache.seen_tokens}")
     output_audio_encodec, output_audio_vocos = detokenize_audio(model_outputs, use_n_codebooks, tokenizer_offset)
 
     return output_audio_encodec, output_audio_vocos
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the audio generator demo")
-    parser.add_argument("--model", type=str, default="Qwen1.5-1.8B-realtime-codec-agent/checkpoint-1824")
+    parser.add_argument("--model", type=str, default="Qwen1.5-1.8B-realtime-codec-agent/checkpoint-140370")
     args = parser.parse_args()
 
     print(f"Running with args: {args}")
@@ -142,8 +165,11 @@ if __name__ == "__main__":
         inputs=[
             gr.Audio(label="Context"),
             gr.Textbox(label="Random seed", value="42"),
+            gr.Checkbox(False, label="Use SinkCache"),
+            gr.Slider(1, 32, value=8, step=1, label="Num Sink Tokens"),
+            gr.Slider(1, 60, value=20, step=1, label="Window Length (seconds)"),
             gr.Radio(["Greedy", "Sampling", "Contrastive"], value="Sampling", label="Decoding"),
-            gr.Slider(1, 20, value=2, step=1, label="Seconds"),
+            gr.Slider(1, 60, value=10, step=1, label="Seconds"),
             gr.Slider(0.1, 10.0, value=1.0, step=0.01, label="Temperature"),
             gr.Slider(1, 10, value=1, step=1, label="Beams"),
             gr.Slider(0, 100, value=0, step=1, label="Top-k"),
