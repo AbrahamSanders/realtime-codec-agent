@@ -22,7 +22,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 # -------------------------------------------------------------------------------------------------------------------
-# Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/examples/pytorch/language-modeling/run_clm.py
+# Adapted from https://github.com/huggingface/transformers/blob/v4.39.1/examples/pytorch/language-modeling/run_clm.py
 # Modified for use with a line-by-line text file dataset containing tokenized audio.
 # -------------------------------------------------------------------------------------------------------------------
 
