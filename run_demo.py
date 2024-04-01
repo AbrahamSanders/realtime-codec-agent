@@ -15,6 +15,7 @@ from vocos import Vocos
 from realtime_codec_agent.audio_mistral import AudioMistralForCausalLM
 from realtime_codec_agent.audio_qwen2 import AudioQwen2ForCausalLM
 from transformers.generation import AlternatingCodebooksLogitsProcessor
+from realtime_codec_agent.utils.generate_utils import ExcludeCodebooksLogitsProcessor
 from realtime_codec_agent.utils.encodec_utils import n_codebooks_to_bandwidth_id
 
 tokenizer = None
@@ -87,9 +88,17 @@ def detokenize_audio(tokens, n_codebooks, tokenizer_offset):
     sr = encodec_model.config.sampling_rate
     return (sr, output_audio_encodec.cpu().numpy()), (sr, output_audio_vocos.cpu().numpy())
 
+def prepare_sink_cache(num_sink_tokens, window_length_seconds, use_n_codebooks, generate_kwargs):
+    window_length = int(window_length_seconds) * use_n_codebooks * 75
+    print (f"Using SinkCache with window_length={window_length} and num_sink_tokens={num_sink_tokens}.")
+    cache = SinkCache(window_length=window_length, num_sink_tokens=num_sink_tokens)
+    generate_kwargs["past_key_values"] = cache
+    generate_kwargs["use_cache"] = True
+
 def generate_audio(
         context_audio, 
         seed, 
+        generate_audio,
         use_sink_cache, 
         num_sink_tokens, 
         window_length_seconds, 
@@ -121,31 +130,43 @@ def generate_audio(
     if decoding == "Contrastive":
         generate_kwargs["penalty_alpha"] = float(penalty_alpha)
 
+    model_inputs = tokenize_audio(context_audio, use_n_codebooks, tokenizer_offset)
+
+    # Generate audio continuation
+    output_audio_encodec, output_audio_vocos = None, None
+    if generate_audio:
+        altCodebooksLogitsProc = AlternatingCodebooksLogitsProcessor(
+            input_start_len = model_inputs["input_ids"].shape[-1],
+            semantic_vocab_size = tokenizer_offset,
+            codebook_size = encodec_model.config.codebook_size
+        )
+        if use_sink_cache:
+            prepare_sink_cache(num_sink_tokens, window_length_seconds, use_n_codebooks, generate_kwargs)
+        if seed:
+            set_seed(int(seed))
+        model_outputs = model.generate(**model_inputs, **generate_kwargs, logits_processor=[altCodebooksLogitsProc])
+        if use_sink_cache:
+            cache = generate_kwargs["past_key_values"]
+            print(f"key_cache: {cache.key_cache[0].shape}\nvalue_cache: {cache.value_cache[0].shape};\nseen_tokens: {cache.seen_tokens}")
+        output_audio_encodec, output_audio_vocos = detokenize_audio(model_outputs, use_n_codebooks, tokenizer_offset)
+
+    # Generate text continuation
+    excCodebooksLogitsProc = ExcludeCodebooksLogitsProcessor(semantic_vocab_size=tokenizer_offset)
+    if use_sink_cache:
+        prepare_sink_cache(num_sink_tokens, window_length_seconds, use_n_codebooks, generate_kwargs)
+    # rough approximation: 2.5 spoken words per second, 1.5 tokens per word
+    generate_kwargs["max_new_tokens"] = round(int(seconds) * 2.5 * 1.5)
     if seed:
         set_seed(int(seed))
+    model_outputs = model.generate(**model_inputs, **generate_kwargs, logits_processor=[excCodebooksLogitsProc])
+    text_start = model_inputs["input_ids"].shape[-1]
+    output_text = tokenizer.decode(model_outputs[0, text_start:], skip_special_tokens=False)
 
-    model_inputs = tokenize_audio(context_audio, use_n_codebooks, tokenizer_offset)
-    altCodebooksLogitsProc = AlternatingCodebooksLogitsProcessor(
-        input_start_len = model_inputs["input_ids"].shape[-1],
-        semantic_vocab_size = tokenizer_offset,
-        codebook_size = encodec_model.config.codebook_size
-    )
-    if use_sink_cache:
-        window_length = int(window_length_seconds) * use_n_codebooks * 75
-        print (f"Using SinkCache with window_length={window_length} and num_sink_tokens={num_sink_tokens}.")
-        cache = SinkCache(window_length=window_length, num_sink_tokens=num_sink_tokens)
-        generate_kwargs["past_key_values"] = cache
-        generate_kwargs["use_cache"] = True
-    model_outputs = model.generate(**model_inputs, **generate_kwargs, logits_processor=[altCodebooksLogitsProc])
-    if use_sink_cache:
-        print(f"key_cache: {cache.key_cache[0].shape}\nvalue_cache: {cache.value_cache[0].shape};\nseen_tokens: {cache.seen_tokens}")
-    output_audio_encodec, output_audio_vocos = detokenize_audio(model_outputs, use_n_codebooks, tokenizer_offset)
-
-    return output_audio_encodec, output_audio_vocos
+    return output_audio_encodec, output_audio_vocos, output_text
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the audio generator demo")
-    parser.add_argument("--model", type=str, default="Qwen1.5-1.8B-realtime-codec-agent/checkpoint-140370")
+    parser.add_argument("--model", type=str, default="Qwen1.5-1.8B-realtime-codec-agent-frozen/checkpoint-56148")
     args = parser.parse_args()
 
     print(f"Running with args: {args}")
@@ -165,6 +186,7 @@ if __name__ == "__main__":
         inputs=[
             gr.Audio(label="Context"),
             gr.Textbox(label="Random seed", value="42"),
+            gr.Checkbox(True, label="Generate Audio"),
             gr.Checkbox(False, label="Use SinkCache"),
             gr.Slider(1, 32, value=8, step=1, label="Num Sink Tokens"),
             gr.Slider(1, 60, value=20, step=1, label="Window Length (seconds)"),
@@ -180,6 +202,7 @@ if __name__ == "__main__":
         outputs=[
             gr.Audio(label="Continuation (EnCodec decoder)"),
             gr.Audio(label="Continuation (Vocos decoder)"),
+            gr.TextArea(label="Continuation (Text)")
         ],
         allow_flagging='never'
     )
