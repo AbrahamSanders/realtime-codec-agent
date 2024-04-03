@@ -3,7 +3,7 @@ import asyncio
 import numpy as np
 import os
 
-from realtime_codec_agent.data_loaders.talkbank_data_loader import TalkbankDataLoader
+from realtime_codec_agent.data_loaders.audio_data_loader import AudioDataLoader
 from sklearn.model_selection import train_test_split
 
 async def main():
@@ -23,7 +23,7 @@ async def main():
     
     args = parser.parse_args()
     
-    loader = TalkbankDataLoader(
+    loader = AudioDataLoader(
         args.encodec_model,
         args.tokenizer,
         use_n_codebooks=args.use_n_codebooks,

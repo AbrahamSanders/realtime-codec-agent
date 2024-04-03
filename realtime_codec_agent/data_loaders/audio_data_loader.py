@@ -22,7 +22,7 @@ async def crawl(downloader, url: str, *args, **kwargs):
             downloader.crawled_links.add(link)
             await crawl(downloader, link, *args, **kwargs)
 
-class TalkbankDataLoader:
+class AudioDataLoader:
     def __init__(self, encodec_modelname, tokenizer_name, use_n_codebooks=2, tokenizer_offset=-1, add_audio_tokens=False, 
                  history_secs=20, overlap_secs=5, drop_last=True, download_dir=None, force_download=False):
         
