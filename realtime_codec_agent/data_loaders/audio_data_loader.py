@@ -89,10 +89,7 @@ class AudioDataLoader:
                 await crawl(downloader, corpus_url, extensions=[".mp3"])
                 await downloader.download_files(full_directory=corpus_path)
 
-            audio_files = []
-            for root, _, files in os.walk(corpus_path):
-                audio_files.extend([os.path.join(root, file) for file in files if file.endswith(".mp3")])
-            audio_files.sort()
+            audio_files = self.get_audio_files(corpus_path)
             for audio_file in tqdm(audio_files, desc="Files"):
                 audio, sr = librosa.load(audio_file, sr=self.encodec_model.config.sampling_rate, mono=True)
 
@@ -103,17 +100,8 @@ class AudioDataLoader:
                     end = start + self.history_secs * sr
                     if self.drop_last and end > audio.shape[-1]:
                         break
-
                     audio_slice = audio[..., start:end]
-                    inputs = self.encodec_processor(raw_audio=audio_slice, sampling_rate=sr, return_tensors="pt").to(self.device)
-                    encoder_outputs = self.encodec_model.encode(**inputs, bandwidth=self.encodec_bandwidth).audio_codes # 1 x 1 x n_codebooks x n_tokens
-
-                    audio_codes = torch.zeros(encoder_outputs.shape[-1] * self.use_n_codebooks, dtype=encoder_outputs.dtype).to(self.device)
-                    for i in range(self.use_n_codebooks):
-                        codebook_offset = i * self.encodec_model.config.codebook_size
-                        audio_codes[i::self.use_n_codebooks] = self.tokenizer_offset + codebook_offset + encoder_outputs[0, 0, i]
-
-                    example = self.tokenizer.decode(audio_codes, skip_special_tokens=False)
+                    example = self.tokenize_audio(audio_slice, sr)
                     if group_by_dialogue:
                         dialogue.append(example)
                     else:
@@ -123,3 +111,22 @@ class AudioDataLoader:
                     start = end - self.overlap_secs * sr
                 if group_by_dialogue and len(dialogue) > 0:
                     yield audio_file, dialogue
+
+    def get_audio_files(self, corpus_path):
+        audio_files = []
+        for root, _, files in os.walk(corpus_path):
+            audio_files.extend([os.path.join(root, file) for file in files if file.endswith(".mp3")])
+        audio_files.sort()
+        return audio_files
+
+    def tokenize_audio(self, audio, sr):
+        inputs = self.encodec_processor(raw_audio=audio, sampling_rate=sr, return_tensors="pt").to(self.device)
+        encoder_outputs = self.encodec_model.encode(**inputs, bandwidth=self.encodec_bandwidth).audio_codes # 1 x 1 x n_codebooks x n_tokens
+
+        audio_codes = torch.zeros(encoder_outputs.shape[-1] * self.use_n_codebooks, dtype=encoder_outputs.dtype).to(self.device)
+        for i in range(self.use_n_codebooks):
+            codebook_offset = i * self.encodec_model.config.codebook_size
+            audio_codes[i::self.use_n_codebooks] = self.tokenizer_offset + codebook_offset + encoder_outputs[0, 0, i]
+
+        audio_tokens = self.tokenizer.decode(audio_codes, skip_special_tokens=False)
+        return audio_tokens
