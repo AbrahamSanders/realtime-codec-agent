@@ -92,24 +92,11 @@ class AudioDataLoader:
             audio_files = self.get_audio_files(corpus_path)
             for audio_file in tqdm(audio_files, desc="Files"):
                 audio, sr = librosa.load(audio_file, sr=self.encodec_model.config.sampling_rate, mono=True)
-
-                if group_by_dialogue:
-                    dialogue = []
-                start = 0
-                while True:
-                    end = start + self.history_secs * sr
-                    if self.drop_last and end > audio.shape[-1]:
-                        break
-                    audio_slice = audio[..., start:end]
-                    example = self.tokenize_audio(audio_slice, sr)
-                    if group_by_dialogue:
-                        dialogue.append(example)
-                    else:
+                dialogue = self.create_audio_examples(audio, sr)
+                if not group_by_dialogue:
+                    for example in dialogue:
                         yield example
-                    if end >= audio.shape[-1]:
-                        break
-                    start = end - self.overlap_secs * sr
-                if group_by_dialogue and len(dialogue) > 0:
+                elif len(dialogue) > 0:
                     yield audio_file, dialogue
 
     def get_audio_files(self, corpus_path):
@@ -118,6 +105,21 @@ class AudioDataLoader:
             audio_files.extend([os.path.join(root, file) for file in files if file.endswith(".mp3")])
         audio_files.sort()
         return audio_files
+    
+    def create_audio_examples(self, audio, sr):
+        examples = []
+        start = 0
+        while True:
+            end = start + self.history_secs * sr
+            if self.drop_last and end > audio.shape[-1]:
+                break
+            audio_slice = audio[..., start:end]
+            example = self.tokenize_audio(audio_slice, sr)
+            examples.append(example)
+            if end >= audio.shape[-1]:
+                break
+            start = end - self.overlap_secs * sr
+        return examples
 
     def tokenize_audio(self, audio, sr):
         inputs = self.encodec_processor(raw_audio=audio, sampling_rate=sr, return_tensors="pt").to(self.device)

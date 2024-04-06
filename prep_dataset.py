@@ -15,14 +15,14 @@ async def main():
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--test-proportion", type=float, default=0.01)
     parser.add_argument("--dev-proportion", type=float, default=0.01)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--debug-num-files", type=int, default=-1)
     parser.add_argument("--encodec-model", default="facebook/encodec_24khz")
     parser.add_argument("--use-n-codebooks", type=int, default=2)
     parser.add_argument("--tokenizer", default="mistralai/Mistral-7B-v0.1")
     parser.add_argument("--tokenizer-offset", type=int, default=-1)
     parser.add_argument("--add-audio-tokens", action="store_true", default=False)
-    parser.add_argument("--prep-alignment-dataset", action="store_true", default=False)
+    parser.add_argument("--prep-alignment-examples", action="store_true", default=False)
     
     args = parser.parse_args()
     
@@ -35,9 +35,10 @@ async def main():
         "download_dir": os.path.join(args.audio_data_dir, "raw"),
         "force_download": args.force_download
     }
-    dataset_type = "align" if args.prep_alignment_dataset else "audio"
-    if args.prep_alignment_dataset:
+    dataset_type = "audio_align" if args.prep_alignment_examples else "audio"
+    if args.prep_alignment_examples:
         loader_kwargs["transcripts_dir"] = os.path.join(args.transcripts_data_dir, "raw")
+        loader_kwargs["random_seed"] = args.random_seed
         loader = AudioTextAlignDataLoader(**loader_kwargs)
     else:
         loader = AudioDataLoader(**loader_kwargs)
@@ -55,9 +56,9 @@ async def main():
             break
     
     dev_test_proportion = args.dev_proportion + args.test_proportion
-    train_dialogues, test_dialogues = train_test_split(np.arange(num_files), test_size=dev_test_proportion, random_state=args.seed)
+    train_dialogues, test_dialogues = train_test_split(np.arange(num_files), test_size=dev_test_proportion, random_state=args.random_seed)
     test_proportion = args.test_proportion / dev_test_proportion
-    dev_dialogues, test_dialogues = train_test_split(test_dialogues, test_size=test_proportion, random_state=args.seed)
+    dev_dialogues, test_dialogues = train_test_split(test_dialogues, test_size=test_proportion, random_state=args.random_seed)
 
     train_dialogues.sort()
     dev_dialogues.sort()
