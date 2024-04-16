@@ -216,11 +216,10 @@ class AudioMistralForCausalLM(MistralForCausalLM):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.audio_lm_head = nn.Linear(config.hidden_size, config.num_codebooks * config.codebook_size, bias=False)
 
-        self.vocab_splits = [(0, self.config.vocab_size)]
-        for i in range(config.num_codebooks):
-            cb_start = config.vocab_size + i*config.codebook_size
-            cb_end = config.vocab_size + (i+1)*config.codebook_size
-            self.vocab_splits.append((cb_start, cb_end))
+        self.vocab_splits = [
+            (0, self.config.vocab_size), 
+            (self.config.vocab_size, self.config.vocab_size + config.num_codebooks * config.codebook_size)
+        ]
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -301,20 +300,22 @@ class AudioMistralForCausalLM(MistralForCausalLM):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
+            loss_fct = CrossEntropyLoss()
             if self.config.isolate_codebook_loss:
-                loss_fct = CrossEntropyLoss(reduction="sum")
                 loss = torch.tensor(0., dtype=shift_logits.dtype, device=shift_logits.device)
-                # Compute loss over tokens of each vocab split (e.g., text tokens, distinct codebook tokens) individually 
-                # (i.e., only logits within each split will contribute to the loss for tokens of that split)
+                # Compute loss over tokens of each vocab split (e.g., text tokens, codebook tokens) individually 
+                # (i.e., only logits within each split will contribute to the loss for tokens of that split, 
+                #  and token losses will be only be averaged within the split, not across all tokens in the batch)
+                num_included_splits = 0
                 for start, end in self.vocab_splits:
-                    split_tokens = (shift_labels >= start) & (shift_labels < end)
+                    split_tokens = (shift_labels >= start) & (shift_labels < end) & (shift_labels != loss_fct.ignore_index)
                     if split_tokens.any():
                         split_shift_logits = shift_logits[split_tokens][..., start:end]
                         split_shift_labels = shift_labels[split_tokens] - start
                         loss += self._compute_loss(loss_fct, split_shift_logits, split_shift_labels)
-                loss /= shift_labels.numel()
+                        num_included_splits += 1
+                loss /= num_included_splits
             else:
-                loss_fct = CrossEntropyLoss()
                 # Flatten the tokens
                 shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
                 shift_labels = shift_labels.view(-1)

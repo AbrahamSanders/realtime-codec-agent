@@ -122,7 +122,8 @@ class AudioTextAlignDataLoader(AudioDataLoader):
             end = round(trans_start_secs * sr)
             audio_slice = audio[..., start:end]
             example = self.tokenize_audio(audio_slice, sr)
-            example += f" {speaker}: {use_text}"
+            #example += f" {speaker}: {use_text}"
+            example += f" {use_text}"
             examples.append(example)
             last_trans_end_secs = trans_end_secs
         return examples

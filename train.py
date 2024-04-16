@@ -38,7 +38,7 @@ from typing import Optional
 import datasets
 import evaluate
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 
 import transformers
 from transformers import (
@@ -64,6 +64,7 @@ from peft import LoraConfig
 from realtime_codec_agent.audio_mistral import AudioMistralForCausalLM, AudioMistralConfig
 from realtime_codec_agent.audio_qwen2 import AudioQwen2ForCausalLM, AudioQwen2Config
 from realtime_codec_agent.utils.tokenizer_utils import add_special_audio_tokens
+from realtime_codec_agent.utils.training_utils import DataCollatorForAlignedDataset
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -185,7 +186,7 @@ class ModelArguments:
     isolate_codebook_loss: bool = field(
         default=False,
         metadata={
-            "help": "Whether to split the vocab by modality (text, individual codebooks) and compute loss for each split individually."
+            "help": "Whether to split the vocab by modality (text, codebooks) and compute loss for each split individually."
         }
     )
     add_audio_tokens: bool = field(
@@ -299,6 +300,18 @@ class DataTrainingArguments:
     keep_linebreaks: bool = field(
         default=False, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
     )
+    audio_examples: float = field(
+        default=1.0,
+        metadata={
+            "help": "The proportion in [0., 1.] of the available audio examples to use for training."
+        }
+    )
+    alignment_examples: float = field(
+        default=0.0,
+        metadata={
+            "help": "The proportion in [0., 1.] of the available alignment examples to use for training."
+        }
+    )
 
     def __post_init__(self):
         if self.streaming:
@@ -336,6 +349,14 @@ def main():
         if model_args.token is not None:
             raise ValueError("`token` and `use_auth_token` are both specified. Please set only the argument `token`.")
         model_args.token = model_args.use_auth_token
+
+    if data_args.alignment_examples > 0. and not model_args.isolate_codebook_loss:
+        warnings.warn(
+            "Alignment examples are enabled but codebook loss isolation is not. This may lead to unexpected results."
+        )
+
+    if not data_args.audio_examples > 0. and not data_args.alignment_examples > 0.:
+        raise ValueError("At least one of `audio_examples` or `alignment_examples` must be greater than 0.")
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -634,7 +655,8 @@ def main():
             k: t #[t[i : i + block_size] for i in range(0, total_length, block_size)]
             for k, t in examples.items()#concatenated_examples.items()
         }
-        result["labels"] = result["input_ids"].copy()
+        if not data_args.alignment_examples > 0.:
+            result["labels"] = result["input_ids"].copy()
         return result
 
     # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
@@ -667,6 +689,31 @@ def main():
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
 
+        if data_args.audio_examples > 0.:
+            audio_train_dataset = train_dataset.filter(lambda x: not (torch.tensor(x["input_ids"]) < config.vocab_size).any())
+            if data_args.audio_examples < 1.:
+                audio_train_dataset = audio_train_dataset.train_test_split(
+                    train_size=data_args.audio_examples, seed=training_args.data_seed
+                )["train"]
+            logger.info(f"Using {len(audio_train_dataset)} audio examples for training.")
+
+        if data_args.alignment_examples > 0.:
+            alignment_train_dataset = train_dataset.filter(lambda x: (torch.tensor(x["input_ids"]) < config.vocab_size).any())
+            if data_args.alignment_examples < 1.:
+                alignment_train_dataset = alignment_train_dataset.train_test_split(
+                    train_size=data_args.alignment_examples, seed=training_args.data_seed
+                )["train"]
+            logger.info(f"Using {len(alignment_train_dataset)} alignment examples for training.")
+
+        if data_args.audio_examples > 0. and data_args.alignment_examples > 0.:
+            train_dataset = concatenate_datasets([audio_train_dataset, alignment_train_dataset])
+        elif data_args.audio_examples > 0.:
+            train_dataset = audio_train_dataset
+        else:
+            train_dataset = alignment_train_dataset
+
+        logger.info(f"Total training dataset size: {len(train_dataset)} examples.")
+
     if training_args.do_eval:
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
@@ -674,6 +721,14 @@ def main():
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
+
+        eval_dataset_dict = {}
+        if data_args.audio_examples > 0.:
+            eval_dataset_dict["audio"] = eval_dataset.filter(lambda x: not (torch.tensor(x["input_ids"]) < config.vocab_size).any())
+            logger.info(f"Using {len(eval_dataset_dict['audio'])} audio examples for evaluation.")
+        if data_args.alignment_examples > 0.:
+            eval_dataset_dict["align"] = eval_dataset.filter(lambda x: (torch.tensor(x["input_ids"]) < config.vocab_size).any())
+            logger.info(f"Using {len(eval_dataset_dict['align'])} alignment examples for evaluation.")
 
         def preprocess_logits_for_metrics(logits, labels):
             if isinstance(logits, tuple):
@@ -702,7 +757,8 @@ def main():
             # by preprocess_logits_for_metrics but we need to shift the labels
             labels = labels[:, 1:].reshape(-1)
             preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
+            include = labels != -100
+            return metric.compute(predictions=preds[include], references=labels[include])
 
     # Initialize our Trainer
     if training_args.do_train and model_args.use_peft:
@@ -727,15 +783,30 @@ def main():
         for name, param in model.named_parameters():
             if name not in trainable_params:
                 param.requires_grad = False
+    elif training_args.do_train and data_args.alignment_examples > 0.:
+        model.lm_head.weight.requires_grad = False
+        model.model.embed_tokens.weight.requires_grad = False
+
+    if data_args.alignment_examples > 0.:
+        if tokenizer._pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        data_collator = DataCollatorForAlignedDataset(
+            tokenizer=tokenizer,
+            pad_to_multiple_of=8,
+            model_vocab_size=config.vocab_size
+        )
+    else:
+        data_collator = default_data_collator
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
+        eval_dataset=eval_dataset_dict if training_args.do_eval else None,
         tokenizer=tokenizer,
         # Data collator will default to DataCollatorWithPadding, so we change it.
-        data_collator=default_data_collator,
+        data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_xla_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
         if training_args.do_eval and not is_torch_xla_available()
