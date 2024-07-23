@@ -1,0 +1,32 @@
+python train.py \
+    --log_level info \
+    --model_name_or_path=Qwen/Qwen1.5-1.8B \
+    --train_file=data/audio/dataset_audio_align_train.txt \
+    --validation_file=data/audio/dataset_audio_align_dev.txt \
+    --per_device_train_batch_size=2 \
+    --per_device_eval_batch_size=2 \
+    --gradient_accumulation_steps=128 \
+    --do_train \
+    --bf16 \
+    --output_dir=Qwen1.5-1.8B-realtime-codec-agent-aligned-stage-1 \
+    --do_eval \
+    --overwrite_output_dir \
+    --seed=42 \
+    --data_seed=42 \
+    --eval_steps=0.1 \
+    --logging_steps=10 \
+    --save_total_limit=2 \
+    --evaluation_strategy=steps \
+    --lr_scheduler_type=cosine \
+    --num_train_epochs=1 \
+    --save_steps=0.5 \
+    --learning_rate=1e-03 \
+    --warmup_ratio=0.03 \
+    --dataloader_drop_last \
+    --encodec_model=facebook/encodec_24khz \
+    --use_n_codebooks=2 \
+    --add_audio_tokens \
+    --audio_examples=0.0 \
+    --alignment_examples=0.25 \
+    --isolate_codebook_loss \
+    --freeze_original_model

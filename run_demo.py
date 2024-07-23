@@ -166,7 +166,7 @@ def generate_audio(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the audio generator demo")
-    parser.add_argument("--model", type=str, default="Qwen1.5-1.8B-realtime-codec-agent-frozen/checkpoint-56148")
+    parser.add_argument("--model", type=str, default="Qwen1.5-1.8B-realtime-codec-agent-aligned-mini-stage-2/checkpoint-7812")
     args = parser.parse_args()
 
     print(f"Running with args: {args}")
