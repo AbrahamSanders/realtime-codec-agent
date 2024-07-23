@@ -776,10 +776,15 @@ def main():
         )
         model.add_adapter(peft_config)
     elif training_args.do_train and model_args.freeze_original_model:
-        trainable_params = set(
-            [f"model.audio_projectors.{i}.weight" for i in range(model_args.use_n_codebooks)]
-            + ["audio_lm_head.weight"]
-        )
+        trainable_params = []
+        for i in range(model_args.use_n_codebooks):
+            trainable_params.append(f"model.audio_projectors.{i}.linear_1.weight")
+            trainable_params.append(f"model.audio_projectors.{i}.linear_1.bias")
+            trainable_params.append(f"model.audio_projectors.{i}.linear_2.weight")
+            trainable_params.append(f"model.audio_projectors.{i}.linear_2.bias")
+        if data_args.audio_examples > 0.:
+            trainable_params.append("audio_lm_head.weight")
+        trainable_params = set(trainable_params)
         for name, param in model.named_parameters():
             if name not in trainable_params:
                 param.requires_grad = False

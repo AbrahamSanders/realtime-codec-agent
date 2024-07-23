@@ -3,6 +3,7 @@ from transformers.models.qwen2 import Qwen2Model, Qwen2ForCausalLM, Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RMSNorm
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils import logging
 from torch import nn
@@ -17,14 +18,31 @@ class AudioQwen2Config(Qwen2Config):
         num_codebooks=2,
         codebook_size=1024,
         codebook_dim=128,
+        projector_hidden_act="gelu",
         isolate_codebook_loss=False,
         **kwargs
     ):
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
         self.codebook_dim = codebook_dim
+        self.projector_hidden_act = projector_hidden_act
         self.isolate_codebook_loss = isolate_codebook_loss
         super().__init__(**kwargs)
+
+# Adapted from transformers.models.llava.modeling_llava.LlavaMultiModalProjector
+class AudioQwen2MultiModalProjector(nn.Module):
+    def __init__(self, config: AudioQwen2Config):
+        super().__init__()
+
+        self.linear_1 = nn.Linear(config.codebook_dim, config.hidden_size, bias=True)
+        self.act = ACT2FN[config.projector_hidden_act]
+        self.linear_2 = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+
+    def forward(self, audio_embeds):
+        hidden_states = self.linear_1(audio_embeds)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
 
 class AudioQwen2Model(Qwen2Model):
     def __init__(self, config: AudioQwen2Config):
@@ -36,7 +54,7 @@ class AudioQwen2Model(Qwen2Model):
         audio_embed = torch.zeros(config.num_codebooks * config.codebook_size, config.codebook_dim)
         self.register_buffer("audio_embed", audio_embed)
         self.audio_projectors = nn.ModuleList(
-            [nn.Linear(config.codebook_dim, config.hidden_size, bias=False) for _ in range(config.num_codebooks)]
+            [AudioQwen2MultiModalProjector(config) for _ in range(config.num_codebooks)]
         )
         self.layers = nn.ModuleList(
             [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
