@@ -169,9 +169,13 @@ data/transcripts/*
 
 experimental
 persimmon-*-realtime-codec-agent*
-Mistral-*-realtime-codec-agent*
-Qwen1.5-*-realtime-codec-agent*
+Mistral-*
+Qwen1.5-*
+Llama-3.2-*
+
 *.wav
 *.mp3
 *.sph
+
 sph2pipe
+*.out
