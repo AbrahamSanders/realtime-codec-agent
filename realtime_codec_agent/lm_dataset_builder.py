@@ -4,6 +4,7 @@ from tqdm import tqdm
 from enum import Enum
 import numpy as np
 import os
+import itertools
 
 from codec_bpe.core.converter import codes_to_chars, UNICODE_OFFSET
 from codec_bpe.core.utils import get_codes_files
@@ -63,16 +64,30 @@ class LMDatasetBuilder:
         if header_end_token is not None and self.tokenizer.convert_tokens_to_ids(header_end_token) is None:
             raise ValueError(f"Token '{header_end_token}' not found in tokenizer")
 
-    def _group_codes_files(self, codes_files: List[str]) -> List[Tuple[str, List[str]]]:
+    def _group_codes_files(self, codes_files: List[str]) -> List[Tuple[str, List[List[str]]]]:
         grouped_codes_files = []
         last_file_root = None
         for codes_file in codes_files:
-            file_root = "_".join(codes_file.split("_")[:-2])
+            codes_file_parts = codes_file.split("_")
+            file_root = "_".join(codes_file_parts[:-2])
+            channel = int(codes_file_parts[-2].lstrip("c"))
             if file_root != last_file_root:
                 grouped_codes_files.append((file_root, []))
                 last_file_root = file_root
-            grouped_codes_files[-1][1].append(codes_file)
-        return grouped_codes_files
+            grouped_codes_files[-1][1].append((codes_file, channel))
+
+        # separate the files in each groups by channel
+        channel_grouped_codes_files = []
+        for file_root, file_group in grouped_codes_files:
+            num_channels = max([channel for _, channel in file_group]) + 1
+            channel_grouped_codes_files.append(
+                (
+                    file_root, 
+                    [[f[0] for f in file_group if f[1] == c] for c in range(num_channels)],
+                )
+            )
+
+        return channel_grouped_codes_files
     
     def _load_transcript(self, transcript_file: str) -> List[Tuple[float, float, str, str]]:
         transcript_lines = []
@@ -104,12 +119,14 @@ class LMDatasetBuilder:
             return []
         
         # convert codes to unicode string
-        chars = codes_to_chars(
-            codes, 
-            self.codebook_size, 
-            copy_before_conversion=False,
-            unicode_offset=self.unicode_offset,
-        )
+        channels_chars = [
+            codes_to_chars(
+                ch_codes, 
+                self.codebook_size, 
+                copy_before_conversion=False,
+                unicode_offset=self.unicode_offset,
+            ) for ch_codes in codes
+        ]
         
         # add a dummy line to handle any audio beyond the last transcribed line
         transcript_lines.append((None, None, None, None))
@@ -118,17 +135,17 @@ class LMDatasetBuilder:
         codes_strs = []
         if self.interleave_order == InterleaveOrder.AUDIO_FIRST or self.interleave_order == InterleaveOrder.BOTH:
             # build the audio-first codes string
-            codes_str = self._build_codes_str(chars, transcript_lines, InterleaveOrder.AUDIO_FIRST)
+            codes_str = self._build_codes_str(channels_chars, transcript_lines, InterleaveOrder.AUDIO_FIRST)
             codes_strs.append((codes_str, InterleaveOrder.AUDIO_FIRST))
         if self.interleave_order == InterleaveOrder.TEXT_FIRST or self.interleave_order == InterleaveOrder.BOTH:
             # build the text-first codes string
-            codes_str = self._build_codes_str(chars, transcript_lines, InterleaveOrder.TEXT_FIRST)
+            codes_str = self._build_codes_str(channels_chars, transcript_lines, InterleaveOrder.TEXT_FIRST)
             codes_strs.append((codes_str, InterleaveOrder.TEXT_FIRST))
         return codes_strs
 
     def _build_codes_str(
         self, 
-        chars: str, 
+        channels_chars: List[str], 
         transcript_lines: List[Tuple[float, float, str, str]], 
         interleave_order: InterleaveOrder,
     ) -> str:
@@ -140,7 +157,7 @@ class LMDatasetBuilder:
         for start_secs, end_secs, speaker, text in transcript_lines:
             transcript_start_secs = start_secs if interleave_order == InterleaveOrder.TEXT_FIRST else end_secs
             if transcript_start_secs is None:
-                line_start_pos = len(chars)
+                line_start_pos = len(channels_chars[0])
             else:
                 # Add any audio up to the point that the transcript line starts
                 line_start_pos = int(transcript_start_secs * self.codec_framerate * self.num_codebooks)
@@ -150,7 +167,9 @@ class LMDatasetBuilder:
                 # add audio start token if specified
                 if self.audio_start_token is not None:
                     str_parts.append(self.audio_start_token)
-                audio_part = chars[last_codes_pos:line_start_pos]
+                audio_part = [chars[last_codes_pos:line_start_pos] for chars in channels_chars]
+                audio_part = list(itertools.chain.from_iterable(zip(*audio_part)))
+                audio_part = "".join(audio_part)
                 str_parts.append(audio_part)
                 last_codes_pos = line_start_pos
                 # add audio end token if specified
@@ -171,16 +190,22 @@ class LMDatasetBuilder:
 
     def iterate_examples(self, codes_path: str, transcripts_path: str, codes_filter: Optional[Union[str, List[str]]] = None) -> Iterator[str]:
         codes_files = get_codes_files(codes_path, codes_filter)
-        # group codes files by root filename (minus channel and starting timestamp)
+        # group codes files by root filename (minus channel and starting timestamp) and then by channel
         grouped_codes_files = self._group_codes_files(codes_files)
-        for file_root, file_group in tqdm(grouped_codes_files, desc="Codes file groups"):
-            # concatenate all codes files in each group
-            codes = np.concatenate([np.load(file) for file in file_group], axis=-1)
-            if len(codes.shape) == 4:
-                codes = codes[0, 0]
-            elif len(codes.shape) == 3:
-                codes = codes[0]
-            codes = codes[:self.num_codebooks]
+        for file_root, file_channels in tqdm(grouped_codes_files, desc="Codes file groups"):
+            # concatenate all codes files in each group for each channel
+            codes = np.stack(
+                [
+                    np.concatenate([np.load(file) for file in file_group], axis=-1) 
+                    for file_group in file_channels
+                ], 
+                axis=0,
+            )
+            if len(codes.shape) == 5:
+                codes = codes[:, 0, 0]
+            elif len(codes.shape) == 4:
+                codes = codes[:, 0]
+            codes = codes[:, :self.num_codebooks] # shape: (num_channels, num_codebooks, sequence_length)
 
             # load the transcript if it exists
             transcript_file = file_root.replace(codes_path, transcripts_path) + ".txt"
