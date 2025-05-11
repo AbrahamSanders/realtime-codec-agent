@@ -10,6 +10,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_codebooks", type=int, required=True)
     parser.add_argument("--codec_framerate", type=float, required=True)
     parser.add_argument("--vocab_cutoff_token", type=str, default="<|end_header|>")
+    parser.add_argument("--num_channels", type=int, default=1)
     parser.add_argument("--num_examples", type=int, default=None)
     args = parser.parse_args()
 
@@ -23,7 +24,7 @@ if __name__ == "__main__":
             tokens = tokenizer(line.rstrip("\n"), return_tensors="np").input_ids
             audio_tokens = tokens[tokens > vocab_cutoff]
             audio_str = tokenizer.decode(audio_tokens)
-            num_units = len(audio_str) / args.num_codebooks
+            num_units = len(audio_str) / (args.num_codebooks * args.num_channels)
             num_secs = num_units / args.codec_framerate
             token_framerate = audio_tokens.shape[-1] / num_secs
             token_framerates.append(token_framerate)

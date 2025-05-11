@@ -9,6 +9,7 @@ if __name__ == "__main__":
     parser.add_argument("--codec_framerate", type=float, required=True)
     parser.add_argument("--audio_start_token", type=str, default="<|audio|>")
     parser.add_argument("--audio_end_token", type=str, default="<|end_audio|>")
+    parser.add_argument("--num_channels", type=int, default=1)
     parser.add_argument("--num_examples", type=int, default=None)
     args = parser.parse_args()
 
@@ -24,7 +25,7 @@ if __name__ == "__main__":
                 line = "".join(line_parts)
             if line[0] == "<":
                 line = line.replace("<", "").replace(">", "")
-            num_units = len(line) / args.num_codebooks
+            num_units = len(line) / (args.num_codebooks * args.num_channels)
             num_seconds = num_units / args.codec_framerate
             lengths.append(num_seconds)
     total_seconds = np.sum(lengths)
