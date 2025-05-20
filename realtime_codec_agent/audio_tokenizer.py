@@ -48,8 +48,11 @@ class AudioTokenizer:
         secs = len(audio_codes_str) / (self.framerate * self.num_channels)
         return secs
 
-    def tokenize_audio(self, audio: Tuple[int, np.ndarray]) -> str:
-        orig_sr, audio = audio
+    def tokenize_audio(self, audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
+        if isinstance(audio, np.ndarray):
+            orig_sr = self.sampling_rate
+        else:
+            orig_sr, audio = audio
         audio = audio.astype("float32") / 32768.0
         if self.num_channels == 1 and audio.ndim > 1:
             audio = librosa.to_mono(audio)

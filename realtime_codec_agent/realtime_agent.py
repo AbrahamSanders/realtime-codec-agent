@@ -1,11 +1,11 @@
 import numpy as np
 import torch
 import time
-from typing import Tuple, Union
+import itertools
+from typing import Tuple, Union, List
 from openai import OpenAI
-from xcodec2.modeling_xcodec2 import XCodec2Model
-from codec_bpe import codes_to_chars, chars_to_codes, UNICODE_OFFSET_LARGE
 
+from .audio_tokenizer import AudioTokenizer
 from .utils.vllm_utils import get_vllm_modelname
 
 class RealtimeAgentResources:
@@ -24,10 +24,7 @@ class RealtimeAgentResources:
         if self.model_name is None:
             raise ValueError("Could not find a model hosted by the vLLM server.")
         
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
-        self.codec_model = XCodec2Model.from_pretrained(xcodec2_model).eval().to(device)
+        self.audio_tokenizer = AudioTokenizer(codec_model=xcodec2_model, device=device)
 
     def create_agent(self, config=None):
         return RealtimeAgent(resources=self, config=config)
@@ -40,13 +37,10 @@ class RealtimeAgentConfig:
         user_identity: str = "A",
         agent_identity: str = "B",
         text_first_temperature: float = 0.8,
-        text_first_presence_penalty=1.0,
-        text_first_frequency_penalty=1.0,
+        text_first_presence_penalty=0.5,
+        text_first_frequency_penalty=0.5,
         audio_first_cont_temperature: float = 0.6, 
         audio_first_trans_temperature: float = 0.2,
-        codec_sample_rate: int = 16000,
-        codec_framerate: float = 50.0, 
-        codec_context_secs: float = 3.0,
         chunk_size_secs: float = 0.3,
         seed: int = 42,
         audio_first_token: str = "<|audio_first|>",
@@ -65,9 +59,6 @@ class RealtimeAgentConfig:
         self.text_first_frequency_penalty = text_first_frequency_penalty
         self.audio_first_cont_temperature = audio_first_cont_temperature
         self.audio_first_trans_temperature = audio_first_trans_temperature
-        self.codec_sample_rate = codec_sample_rate
-        self.codec_framerate = codec_framerate
-        self.codec_context_secs = codec_context_secs
         self.chunk_size_secs = chunk_size_secs
         self.seed = seed
         self.audio_first_token = audio_first_token
@@ -76,13 +67,6 @@ class RealtimeAgentConfig:
         self.end_header_token = end_header_token
         self.start_audio_token = start_audio_token
         self.end_audio_token = end_audio_token
-
-        # computed
-        self.codec_context_samples = int(codec_context_secs * codec_sample_rate)
-        self.codec_context_frames = int(codec_context_secs * codec_framerate)
-        self.chunk_size_samples = int(chunk_size_secs * codec_sample_rate)
-        self.chunk_size_frames = int(chunk_size_secs * codec_framerate)
-
 
     def __eq__(self, other):
         return self.__dict__ == other.__dict__
@@ -95,66 +79,32 @@ class RealtimeAgent:
 
         if config is None:
             config = RealtimeAgentConfig()
-        self.config = config 
+        self.set_config(config)
 
         self.reset()
 
     def reset(self):
+        self.resources.audio_tokenizer.reset_context()
         c = self.config
         common_header = f"{c.header_speaker_token}{c.user_identity}{c.header_speaker_token}{c.agent_identity}{c.end_header_token}"
         self.audio_first_sequence = f"{c.audio_first_token}{common_header}"
         self.text_first_sequence = f"{c.text_first_token}{common_header}"
         if self.config.user_voice_enrollment is not None:
-            enrollment_str = self.tokenize_audio(self.config.user_voice_enrollment)
-            self.audio_first_sequence += f"{c.start_audio_token}{enrollment_str}{c.end_audio_token} {c.user_identity}: {c.user_voice_enrollment_text}{c.start_audio_token}"
-            self.text_first_sequence +=  f" {c.user_identity}: {c.user_voice_enrollment_text}{c.start_audio_token}{enrollment_str}"
-            self.audio_history_str = enrollment_str
+            silence_audio_str = self.resources.audio_tokenizer.tokenize_audio(np.zeros_like(self.config.user_voice_enrollment))
+            enrollment_audio_str = self.resources.audio_tokenizer.tokenize_audio(self.config.user_voice_enrollment)
+            enrollment_audio_str = "".join(list(itertools.chain.from_iterable(zip(*[enrollment_audio_str, silence_audio_str]))))
+
+            self.audio_first_sequence += f"{c.start_audio_token}{enrollment_audio_str}{c.end_audio_token} {c.user_identity}: {c.user_voice_enrollment_text}{c.start_audio_token}"
+            self.text_first_sequence +=  f" {c.user_identity}: {c.user_voice_enrollment_text}{c.start_audio_token}{enrollment_audio_str}"
         else:
             self.audio_first_sequence += c.start_audio_token
             self.text_first_sequence += c.start_audio_token
-            self.audio_history_str = ""
-        self.audio_history = np.zeros((2, c.chunk_size_samples), dtype=np.int16)
-        
+        self.audio_history = np.zeros((2, 0), dtype=np.int16)
 
     def set_config(self, config: RealtimeAgentConfig):
         self.config = config
-
-    def tokenize_audio(self, audio):
-        audio = audio.astype("float32") / 32768.0
-        audio = torch.tensor(audio).unsqueeze(0).to(self.resources.device)
-
-        # get audio codes
-        encoder_outputs = self.resources.codec_model.encode_code(audio, sample_rate=self.config.codec_sample_rate)
-
-        # convert to unicode string
-        audio_codes_str = codes_to_chars(
-            encoder_outputs[0],
-            65536,
-            unicode_offset=UNICODE_OFFSET_LARGE,
-        )
-
-        return audio_codes_str
-
-    def detokenize_audio(self, audio_codes_str):
-        # convert unicode string to audio codes
-        audio_codes, _, end_hanging = chars_to_codes(
-            audio_codes_str, 
-            1, 
-            65536,
-            return_hanging_codes_chars=True, 
-            return_tensors="pt",
-            unicode_offset=UNICODE_OFFSET_LARGE,
-        )
-        audio_codes = audio_codes.unsqueeze(0).to(self.resources.device)
-        
-        # decode audio codes with codec
-        with torch.no_grad():
-            output_audio = self.resources.codec_model.decode_code(audio_codes)
-
-        # return audio
-        output_audio = output_audio[0, 0].cpu().numpy()
-        output_audio = (output_audio * 32767.0).astype(np.int16)
-        return output_audio, end_hanging
+        self.chunk_size_samples = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.sampling_rate)
+        self.chunk_size_frames = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.framerate * 2)
 
     def get_completion(
         self, 
@@ -182,16 +132,16 @@ class RealtimeAgent:
             stop=stop,
             extra_body=extra_body,
         )
-        completion_text = completion.choices[0].text
+        completion_str = completion.choices[0].text
         finish_reason = completion.choices[0].finish_reason
-        return completion_text, finish_reason
+        return completion_str, finish_reason
 
     def predict_transcription(self):
         # decide if it's time to transcribe by generating the next chunk in the audio-first direction and checking if
         # the model predicts a transcription within it
         _, finish_reason = self.get_completion(
             self.audio_first_sequence,
-            max_tokens=self.config.chunk_size_frames,
+            max_tokens=self.chunk_size_frames,
             temperature=self.config.audio_first_cont_temperature,
             stop=self.config.end_audio_token,
         )
@@ -208,98 +158,111 @@ class RealtimeAgent:
             if transcription.lstrip().startswith(self.config.user_identity):
                 # identify the first chunk in the audio sequence that was transcribed
                 last_audio_start_pos = self.audio_first_sequence.rfind(self.config.start_audio_token) + len(self.config.start_audio_token)
-                first_chunk = self.audio_first_sequence[last_audio_start_pos:last_audio_start_pos+self.config.chunk_size_frames]
+                first_chunk = self.audio_first_sequence[last_audio_start_pos:last_audio_start_pos+self.chunk_size_frames]
                 # locate the chunk in the text-first sequence
                 first_chunk_pos = self.text_first_sequence.rfind(first_chunk)
+                # insert it here
                 if first_chunk_pos != -1:
-                    # insert it here
+                    start_audio_token = self.config.start_audio_token
+                    end_audio_token = self.config.end_audio_token
+                    if self.text_first_sequence[first_chunk_pos-len(self.config.start_audio_token):first_chunk_pos] == self.config.start_audio_token:
+                        first_chunk_pos -= len(self.config.start_audio_token)
+                        start_audio_token = end_audio_token = ""
                     self.text_first_sequence = (
-                        f"{self.text_first_sequence[:first_chunk_pos]}{self.config.end_audio_token}"
+                        f"{self.text_first_sequence[:first_chunk_pos]}{end_audio_token}"
                         f"{transcription}"
-                        f"{self.config.start_audio_token}{self.text_first_sequence[first_chunk_pos:]}"
+                        f"{start_audio_token}{self.text_first_sequence[first_chunk_pos:]}"
                     )
                 else:
                     print("Warning: could not find the chunk in the text-first sequence")
             # append to the audio-first sequence
             self.audio_first_sequence += f"{transcription}{self.config.start_audio_token}"
 
-    def predict_next_chunk(self):
-        audio_completion_text, finish_reason = self.get_completion(
-            self.text_first_sequence,
-            max_tokens=self.config.chunk_size_frames,
-            temperature=self.config.text_first_temperature,
-            presence_penalty=self.config.text_first_presence_penalty,
-            frequency_penalty=self.config.text_first_frequency_penalty,
-            stop=self.config.end_audio_token,
-        )
-        self.audio_first_sequence += audio_completion_text
-        self.text_first_sequence += audio_completion_text
-        self.audio_history_str += audio_completion_text
-        if finish_reason == "stop":
+    def predict_next_chunk(self) -> List[str]:
+        completion_prompt = self.text_first_sequence
+        completion_segments = []
+        remaining_frames = self.chunk_size_frames
+        while True:
+            completion_str, _ = self.get_completion(
+                completion_prompt,
+                max_tokens=remaining_frames,
+                temperature=self.config.text_first_temperature,
+                presence_penalty=self.config.text_first_presence_penalty,
+                frequency_penalty=self.config.text_first_frequency_penalty,
+                stop=self.config.end_audio_token,
+            )
+            # make sure completion length is even (ends with a complete two-channel frame)
+            div_rem = len(completion_str) % 2
+            completion_str = completion_str[:(-div_rem or None)]
+            completion_segments.append(completion_str)
+            # check if the completion is finished
+            remaining_frames -= len(completion_str)
+            if remaining_frames == 0:
+                break
             # get the utterance text completion from the model
-            self.text_first_sequence += f"{self.config.end_audio_token} {self.config.agent_identity}:"
+            completion_prompt += completion_str
+            segment_start_pos = len(completion_prompt)
+            completion_prompt += f"{self.config.end_audio_token} {self.config.agent_identity}:"
             speaker_text, _ = self.get_completion(
-                self.text_first_sequence,
+                completion_prompt,
                 max_tokens=100,
                 temperature=self.config.text_first_temperature,
                 presence_penalty=self.config.text_first_presence_penalty,
                 frequency_penalty=self.config.text_first_frequency_penalty,
                 stop=self.config.start_audio_token,
             )
-            self.text_first_sequence += f"{speaker_text}{self.config.start_audio_token}"
-            remaining_frames = self.config.chunk_size_frames - len(audio_completion_text)
-            audio_completion_text2, _ = self.get_completion(
-                self.text_first_sequence,
-                max_tokens=remaining_frames,
-                temperature=self.config.text_first_temperature,
-                presence_penalty=self.config.text_first_presence_penalty,
-                frequency_penalty=self.config.text_first_frequency_penalty,
-            )
-            self.audio_first_sequence += audio_completion_text2
-            self.text_first_sequence += audio_completion_text2
-            self.audio_history_str += audio_completion_text2
+            completion_prompt += f"{speaker_text}{self.config.start_audio_token}"
+            completion_segments.append(completion_prompt[segment_start_pos:])
+
+        return completion_segments
 
     def process_audio(self, audio_data: np.ndarray) -> np.ndarray:
         print(f'Data from microphone:{audio_data.shape, audio_data.dtype, audio_data.min(), audio_data.max()}')
-        if audio_data.shape[-1] != self.config.chunk_size_samples:
-            raise ValueError(f"audio_data must have length {self.config.chunk_size_samples}, but got {audio_data.shape[-1]}")
-
-        # insert the input audio to the audio history at the current chunk
-        self.audio_history[0, -self.config.chunk_size_samples:] = audio_data
-
-        # tokenize the input audio chunk with context
-        if audio_data.max() > 200.0:
-            # zero out the predicted audio chunk
-            self.audio_history[1, -self.config.chunk_size_samples:] = np.zeros_like(audio_data)
-            audio_with_ctx = self.audio_history[..., -self.config.codec_context_samples:].astype(np.float32) / 32767.0
-            audio_with_ctx = audio_with_ctx.mean(axis=0)
-            audio_with_ctx = (audio_with_ctx * 32767.0).astype(np.int16)
-
-            input_audio_str = self.tokenize_audio(audio_with_ctx)
-            input_audio_str = input_audio_str[-self.config.chunk_size_frames:]
-            # Replace the predicted audio chunk codes with the input audio codes
-            # TODO: this could end up clipping off the last text prediction
-            self.audio_first_sequence = self.audio_first_sequence[:-self.config.chunk_size_frames] + input_audio_str
-            self.text_first_sequence = self.text_first_sequence[:-self.config.chunk_size_frames] + input_audio_str
-            self.audio_history_str = self.audio_history_str[:-self.config.chunk_size_frames] + input_audio_str
+        if audio_data.shape[-1] != self.chunk_size_samples:
+            raise ValueError(f"audio_data must have length {self.chunk_size_samples}, but got {audio_data.shape[-1]}")
 
         # get the audio transcription from the model up to the current chunk, if predicted
         self.predict_transcription()
 
-        # get the audio completion from the model for the next chunk
-        self.predict_next_chunk()
+        # get the audio completion from the model for the next chunk. This comes back as a list of alternating "segments" of
+        # audio and text / control tokens, where the length of all audio segments sum up to self.chunk_size_frames. 
+        # For example: "audio_codes_1<|end_audio|> B: what's up?<|audio|>audio_codes_2"
+        # would come back as: ["audio_codes_1", "<|end_audio|> B: what's up?<|audio|>", "audio_codes_2"]
+        completion_segments = self.predict_next_chunk()
 
-        # detokenize the audio completion with context
-        audio_str_with_context = self.audio_history_str[-self.config.codec_context_frames:]
-        processed_audio, _ = self.detokenize_audio(audio_str_with_context)
-        processed_audio = processed_audio[..., -self.config.chunk_size_samples:]
+        # tokenize the audio input
+        input_audio_str = self.resources.audio_tokenizer.tokenize_audio(audio_data)
 
-        # append the output audio to the audio history as the next chunk with a silent placeholder for the next input
-        next_chunk_hist = np.stack((np.zeros_like(processed_audio), processed_audio), axis=0)
-        self.audio_history = np.concatenate((self.audio_history, next_chunk_hist), axis=-1)
+        # substitute the actual input (user) audio codes in place of the predicted ones, and append the completion to both sequences.
+        # text completions only get appended to the text-first sequence while audio completions get appended to both sequences.
+        audio_str_ch_2 = ""
+        for i, segment in enumerate(completion_segments):
+            # even segments are audio, odd segments are text + control tokens
+            if i % 2 == 0:
+                # split audio into two channels, discarding the first (user) channel.
+                # predicted user audio may be used for planning in the future but for now we just discard it
+                seg_audio_str_ch_2 = segment[1::2]
+                # interleave using the actual user input audio codes
+                ch_1_start = len(audio_str_ch_2)
+                seg_audio_str_ch_1 = input_audio_str[ch_1_start:ch_1_start+len(seg_audio_str_ch_2)]
+                seg_audio_str_interleaved = "".join(list(itertools.chain.from_iterable(zip(*[seg_audio_str_ch_1, seg_audio_str_ch_2]))))
+                # append the interleaved audio codes to both sequences
+                self.audio_first_sequence += seg_audio_str_interleaved
+                self.text_first_sequence += seg_audio_str_interleaved
+                audio_str_ch_2 += seg_audio_str_ch_2
+            else:
+                # append the text + control tokens segment to the text-first sequence
+                self.text_first_sequence += segment
 
-        print(f'Data from model:{processed_audio.shape, processed_audio.dtype, processed_audio.min(), processed_audio.max()}')
-        return processed_audio
+        # detokenize the output (agent) audio from channel 2
+        (_, audio_ch_2), _ = self.resources.audio_tokenizer.detokenize_audio(audio_str_ch_2)
+        audio_ch_2 = (audio_ch_2 * 32767.0).astype(np.int16)
+
+        # append the input and output audio to the audio history
+        self.audio_history = np.concatenate((self.audio_history, np.stack([audio_data, audio_ch_2], axis=0)), axis=-1)
+
+        print(f'Data from model:{audio_ch_2.shape, audio_ch_2.dtype, audio_ch_2.min(), audio_ch_2.max()}')
+        return audio_ch_2
 
 class RealtimeAgentMultiprocessing:
     def __init__(
@@ -363,6 +326,7 @@ class RealtimeAgentMultiprocessing:
 
                 if self.reset_flag.value:
                     agent.reset()
+                    self._skip_queue(self.input_queue)
                     self.reset_flag.value = False
                     print(">>> Agent reset! <<<")
 

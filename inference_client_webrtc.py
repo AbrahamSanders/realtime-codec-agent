@@ -60,7 +60,7 @@ class AudioClient:
         self.agent.reset()
     
     def _resample(self, audio_data: np.ndarray, resampler: torchaudio.transforms.Resample) -> np.ndarray:
-        audio_data = audio_data.astype(np.float32) / 32767.0
+        audio_data = audio_data.astype(np.float32) / 32768.0
         audio_data = resampler(torch.tensor(audio_data)).numpy()
         audio_data = (audio_data * 32767.0).astype(np.int16)
         return audio_data
@@ -92,7 +92,7 @@ class AudioClient:
         elif current_channels == 1 and channels == 2:
             audio_data = np.tile(audio_data, 2).reshape(2, -1)
         elif current_channels == 2 and channels == 1:
-            audio_data = audio_data.astype(np.float32) / 32767.0
+            audio_data = audio_data.astype(np.float32) / 32768.0
             audio_data = audio_data.mean(axis=0)
             audio_data = (audio_data * 32767.0).astype(np.int16)
         return audio_data
@@ -197,8 +197,8 @@ if __name__ == "__main__":
         user_voice_enrollment = st.audio_input("Record yourself saying something.")
         user_voice_enrollment_text = st.text_input("What did you say?", "hello, how are you?")
         text_first_temperature = st.slider("Text First Temperature", 0.0, 1.0, 0.8, 0.01)
-        text_first_presence_penalty = st.slider("Text First Presence Penalty", -2.0, 2.0, 1.0, 0.1)
-        text_first_frequency_penalty = st.slider("Text First Frequency Penalty", -2.0, 2.0, 1.0, 0.1)
+        text_first_presence_penalty = st.slider("Text First Presence Penalty", -2.0, 2.0, 0.5, 0.1)
+        text_first_frequency_penalty = st.slider("Text First Frequency Penalty", -2.0, 2.0, 0.5, 0.1)
         audio_first_cont_temperature = st.slider("Audio First Continuation Temperature", 0.0, 1.0, 0.6, 0.01)
         audio_first_trans_temperature = st.slider("Audio First Transcription Temperature", 0.0, 1.0, 0.2, 0.01)
         if st.button("Update"):
