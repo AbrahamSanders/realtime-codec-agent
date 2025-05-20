@@ -221,6 +221,9 @@ class RealtimeAgent:
         if audio_data.shape[-1] != self.chunk_size_samples:
             raise ValueError(f"audio_data must have length {self.chunk_size_samples}, but got {audio_data.shape[-1]}")
 
+        if np.abs(audio_data).max() < 100.0:
+            audio_data = np.zeros_like(audio_data)
+
         # get the audio transcription from the model up to the current chunk, if predicted
         self.predict_transcription()
 

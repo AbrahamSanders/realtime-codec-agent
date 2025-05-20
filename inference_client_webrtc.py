@@ -13,7 +13,7 @@ from realtime_codec_agent.realtime_agent import RealtimeAgentMultiprocessing, Re
 @st.cache_resource
 def get_agent(_args):
     agent = RealtimeAgentMultiprocessing(
-        config=RealtimeAgentConfig(),
+        config=RealtimeAgentConfig(chunk_size_secs=BLOCK_SIZE/SAMPLE_RATE),
         vllm_base_url=_args.vllm_base_url,
     )
     return agent
@@ -50,6 +50,7 @@ class AudioClient:
             text_first_frequency_penalty=text_first_frequency_penalty,
             audio_first_cont_temperature=audio_first_cont_temperature,
             audio_first_trans_temperature=audio_first_trans_temperature,
+            chunk_size_secs=BLOCK_SIZE/SAMPLE_RATE,
         )
         self.agent.queue_config(config)
 
