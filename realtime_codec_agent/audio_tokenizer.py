@@ -3,9 +3,12 @@ import librosa
 import numpy as np
 import itertools
 import math
+from huggingface_hub import hf_hub_download
 from typing import Optional, Tuple, Union
+from safetensors import safe_open
 from codec_bpe import codes_to_chars, chars_to_codes, UNICODE_OFFSET_LARGE
 from xcodec2.modeling_xcodec2 import XCodec2Model
+from xcodec2.configuration_bigcodec import BigCodecConfig
 
 class AudioTokenizer:
     def __init__(
@@ -23,7 +26,13 @@ class AudioTokenizer:
         self.device = device
 
         if isinstance(codec_model, str):
-            codec_model = XCodec2Model.from_pretrained(codec_model)
+            ckpt_path = hf_hub_download(repo_id=codec_model, filename="model.safetensors")
+            ckpt = {}
+            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    ckpt[k.replace(".beta", ".bias")] = f.get_tensor(k)
+            codec_config = BigCodecConfig.from_pretrained(codec_model)
+            codec_model = XCodec2Model.from_pretrained(None, config=codec_config, state_dict=ckpt)
         self.codec_model = codec_model.eval().to(self.device)
 
         self.num_channels = num_channels
@@ -53,7 +62,8 @@ class AudioTokenizer:
             orig_sr = self.sampling_rate
         else:
             orig_sr, audio = audio
-        audio = audio.astype("float32") / 32768.0
+        if audio.dtype == np.int16:
+            audio = audio.astype("float32") / 32768.0
         if self.num_channels == 1 and audio.ndim > 1:
             audio = librosa.to_mono(audio)
         # resample to codec sample rate if needed
