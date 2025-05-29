@@ -173,6 +173,7 @@ Mistral-*
 Qwen1.5-*
 Llama-3.2-*
 
+output*.txt
 *.wav
 *.mp3
 *.sph

@@ -12,8 +12,7 @@ pylangacq
 requests
 scipy
 soundfile
-streamlit
-streamlit-webrtc
+fastrtc
 torch
 torchaudio
 tqdm
