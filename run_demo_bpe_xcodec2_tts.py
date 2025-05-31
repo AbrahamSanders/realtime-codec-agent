@@ -65,7 +65,7 @@ def generate_audio(
             frequency_penalty=0.5,
             stop="<|end_audio|>",
         )
-        (_, audio_chunk), end_hanging = audio_tokenizer.detokenize_audio(end_hanging + completion.choices[0].text)
+        (_, audio_chunk), end_hanging, _ = audio_tokenizer.detokenize_audio(end_hanging + completion.choices[0].text)
         sequence += completion.choices[0].text[:(-len(end_hanging) or None)] + "<|end_audio|>"
         transcription_audio = np.concatenate((transcription_audio, audio_chunk.reshape(audio_tokenizer.num_channels, -1)), axis=-1)
         outputs = prep_for_output(audio_chunk, transcription_audio, audio_tokenizer.sampling_rate, sequence, show_all_codes)

@@ -96,12 +96,12 @@ def generate_audio(
         completion_text += chunk_text
         audio_str_secs = audio_tokenizer.get_audio_codes_str_secs(audio_str)
         if audio_str_secs >= 2.0:
-            (_, output_audio), audio_str = audio_tokenizer.detokenize_audio(audio_str)
+            (_, output_audio), audio_str, _ = audio_tokenizer.detokenize_audio(audio_str)
             completion_audio = np.concatenate((completion_audio, output_audio.reshape(audio_tokenizer.num_channels, -1)), axis=-1)
             outputs = prep_for_output(output_audio, completion_audio, audio_tokenizer.sampling_rate, completion_text, show_all_codes)
             yield outputs
     if len(audio_str) > 0:
-        (_, output_audio), _ = audio_tokenizer.detokenize_audio(audio_str)
+        (_, output_audio), _, _ = audio_tokenizer.detokenize_audio(audio_str)
         completion_audio = np.concatenate((completion_audio, output_audio.reshape(audio_tokenizer.num_channels, -1)), axis=-1)
         outputs = prep_for_output(output_audio, completion_audio, audio_tokenizer.sampling_rate, completion_text, show_all_codes)
         yield outputs

@@ -8,6 +8,7 @@ from vllm import LLM, SamplingParams, TokensPrompt
 from dataclasses import dataclass
 
 from .audio_tokenizer import AudioTokenizer
+from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
 
 
 class RealtimeAgentResources:
@@ -32,7 +33,7 @@ class RealtimeAgentResources:
                 enforce_eager=debug,
             )
         self.tokenizer = AutoTokenizer.from_pretrained(vllm_model)
-        self.audio_tokenizer = AudioTokenizer(codec_model=xcodec2_model, device=device)
+        self.audio_tokenizer = AudioTokenizer(codec_model=xcodec2_model, device=device, context_secs=2.0)
 
     def create_agent(self, config=None):
         return RealtimeAgent(resources=self, config=config)
@@ -49,6 +50,7 @@ class RealtimeAgentConfig:
     audio_first_cont_temperature: float = 0.6 
     audio_first_trans_temperature: float = 0.2
     chunk_size_secs: float = 0.7
+    chunk_fade_secs: float = 0.05
     max_seq_length: int = 4096
     trim_by: int = 1024
     seed: Optional[int] = None
@@ -58,6 +60,12 @@ class RealtimeAgentConfig:
     end_header_token: str = "<|end_header|>"
     start_audio_token: str = "<|audio|>"
     end_audio_token: str = "<|end_audio|>"
+
+    def __post_init__(self):
+        if int(self.chunk_size_secs*100) % 2 != 0:
+            raise ValueError("Chunk size must be a multiple of 0.02 seconds.")
+        if self.chunk_fade_secs > self.chunk_size_secs:
+            raise ValueError("Chunk fade length cannot be longer than the chunk size.")
 
 @dataclass
 class GenerateParams:
@@ -109,13 +117,15 @@ class RealtimeAgent:
 
         self.generated_tokens = 0
         self.generated_audio_tokens = 0
-        self.audio_history = np.zeros((2, 0), dtype=np.int16)
+        self.audio_history_ch1, self.audio_history_ch2 = np.zeros((2, 0), dtype=np.float32)
 
     def set_config(self, config: RealtimeAgentConfig):
         self.config = config
         
         self.chunk_size_samples = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.sampling_rate)
         self.chunk_size_frames = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.framerate * 2)
+
+        self.crossfade_ramps = create_crossfade_ramps(self.resources.audio_tokenizer.sampling_rate, fade_secs=self.config.chunk_fade_secs)
 
         self.end_header_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_header_token)
         self.start_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.start_audio_token)
@@ -308,38 +318,48 @@ class RealtimeAgent:
         return out_chunk_input_ids
 
     def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
-        print(f'Data from microphone:{audio_chunk.shape, audio_chunk.dtype, audio_chunk.min(), audio_chunk.max()}')
+        # Sanity check - input size
         if audio_chunk.shape[-1] != self.chunk_size_samples:
             raise ValueError(f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}")
 
-        if np.abs(audio_chunk).max() < 100.0:
-            audio_chunk = np.zeros_like(audio_chunk)
-
+        # Encode audio chunk to input ids
         audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)
         audio_chunk_input_ids = self.resources.tokenizer(audio_chunk_str, add_special_tokens=False, return_tensors="pt").input_ids
         
+        # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
         if self.resources.llm is None:
             # Mock mode, just return the audio chunk as is
             out_chunk_input_ids = audio_chunk_input_ids
         else:
             out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids)
 
+        # Decode input ids to audio chunk and append to the audio history
         out_chunk_str = self.resources.tokenizer.decode(out_chunk_input_ids[0], skip_special_tokens=False)
-        (_, out_chunk), _ = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str)
-        out_chunk = (out_chunk * 32767.0).astype(np.int16)
-        if out_chunk.shape[-1] != audio_chunk.shape[-1]:
-            max_chunk_len = max(out_chunk.shape[-1], audio_chunk.shape[-1])
-            out_chunk = np.pad(out_chunk, (0, max_chunk_len - out_chunk.shape[-1]), mode='constant')
-            audio_chunk = np.pad(audio_chunk, (0, max_chunk_len - audio_chunk.shape[-1]), mode='constant')
-        self.audio_history = np.concatenate((self.audio_history, np.stack((out_chunk, audio_chunk), axis=0)), axis=1)
+        (_, out_chunk), _, preroll_samples = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str, preroll_samples=self.crossfade_ramps[0])
+        out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
+        self.audio_history_ch1 = smooth_join(self.audio_history_ch1, out_chunk, *self.crossfade_ramps)
+        self.audio_history_ch2 = np.concatenate((self.audio_history_ch2, audio_chunk), axis=-1)
 
-        print(f'Data from model:{out_chunk.shape, out_chunk.dtype, out_chunk.min(), out_chunk.max()}')
+        # Emit the output chunk from the audio history, shifted left by chunk_fade_secs.
+        # This is done because the smooth join (crossfade) modifies the tail of the previous chunk.
+        # So, we include the tail of the previous chunk in the output and exclude the tail of the current chunk.
+        out_chunk = self.audio_history_ch1[-self.chunk_size_samples-self.crossfade_ramps[0]:-self.crossfade_ramps[0]]
+        # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
+        out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples, pad_side="left")
+
+        # Sanity check - output size
+        if out_chunk.shape[-1] != self.chunk_size_samples:
+            raise ValueError(f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}")
         return out_chunk
     
     def get_sequence_strs(self) -> Tuple[str, str]:
         audio_first_sequence = self.resources.tokenizer.decode(self.audio_first_input_ids[0], skip_special_tokens=False)
         text_first_sequence = self.resources.tokenizer.decode(self.text_first_input_ids[0], skip_special_tokens=False)
         return audio_first_sequence, text_first_sequence
+    
+    def get_audio_history(self) -> np.ndarray:
+        audio_history = np.stack([self.audio_history_ch1, self.audio_history_ch2], axis=0)
+        return audio_history
 
 class RealtimeAgentMultiprocessing:
     def __init__(

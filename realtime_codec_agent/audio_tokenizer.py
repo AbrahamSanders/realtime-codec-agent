@@ -99,7 +99,7 @@ class AudioTokenizer:
 
         return audio_codes_str
 
-    def detokenize_audio(self, audio_codes_str: str) -> Tuple[Tuple[int, np.ndarray], str]:
+    def detokenize_audio(self, audio_codes_str: str, preroll_samples: int = 0) -> Tuple[Tuple[int, np.ndarray], str]:
         # make sure len(audio_codes_str) is divisible by num_channels
         audio_codes_str, end_hanging = self._drop_hanging_channel_codes(audio_codes_str)
         
@@ -131,12 +131,13 @@ class AudioTokenizer:
 
         # discard context audio that comes before the codes we are detokenizing
         audio_secs = self.get_audio_codes_str_secs(audio_codes_str)
-        audio_samples = int(audio_secs * self.sampling_rate)
+        audio_samples = int(audio_secs * self.sampling_rate) + preroll_samples
         output_audio = output_audio[..., -audio_samples:]
+        preroll_samples = max(0, preroll_samples-audio_samples+output_audio.shape[-1])
 
         # return audio
         output_audio = output_audio[0, 0] if self.num_channels == 1 else output_audio[0]
-        return (self.sampling_rate, output_audio.cpu().numpy()), end_hanging
+        return (self.sampling_rate, output_audio.cpu().numpy()), end_hanging, preroll_samples
     
     def _drop_hanging_channel_codes(self, audio_str: str) -> Tuple[str, str]:
         div_rem = len(audio_str) % self.num_channels

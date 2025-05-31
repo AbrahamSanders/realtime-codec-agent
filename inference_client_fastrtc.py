@@ -25,11 +25,22 @@ class AgentHandler(StreamHandler):
     def emit(self) -> None:
         try:
             chunk = self.queue.get_nowait()
-            out_chunk = self.agent.process_audio(chunk.squeeze(0))
-            out_chunk = np.expand_dims(out_chunk, axis=0)
-            return (self.output_sample_rate, out_chunk)
         except Empty:
             return None
+        
+        print(f'Data from microphone:{chunk.shape, chunk.dtype, chunk.min(), chunk.max()}')
+        
+        # Suppress low amplitude noise from the microphone
+        if np.abs(chunk).max() < 100:
+            chunk = np.zeros_like(chunk)
+        
+        # Process the chunk and get the next output
+        chunk = chunk.squeeze(0).astype(np.float32) / 32768.0
+        out_chunk = self.agent.process_audio(chunk)
+        out_chunk = np.expand_dims((out_chunk * 32767.0).astype(np.int16), axis=0)
+        
+        print(f'Data from model:{out_chunk.shape, out_chunk.dtype, out_chunk.min(), out_chunk.max()}')
+        return (self.output_sample_rate, out_chunk)
 
     def copy(self):
         return AgentHandler(self.agent)
@@ -47,7 +58,9 @@ class AgentHandler(StreamHandler):
             f.write("---------------------------------------------------------------------------------------\n")
             f.write(text_first_sequence)
             f.write("\n")
-        sf.write("output.wav", self.agent.audio_history.T, self.output_sample_rate)
+        audio_history = self.agent.get_audio_history()
+        audio_history = (audio_history * 32767.0).astype(np.int16)
+        sf.write("output.wav", audio_history.T, self.output_sample_rate)
         print(">>> Stopped <<<")
 
     def start_up(self) -> None:
