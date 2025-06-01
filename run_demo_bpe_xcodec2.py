@@ -7,6 +7,7 @@ from openai import OpenAI
 
 from realtime_codec_agent.audio_tokenizer import AudioTokenizer
 from realtime_codec_agent.utils.vllm_utils import get_vllm_modelname
+from realtime_codec_agent.utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ client = None
 model_name = None
 
 audio_tokenizer = None
+crossfade_ramps = None
 
 shorten_codes_regex = r"(?<=[^>]{4})[^<>]+(?=[^<]{4}<\|end_audio\|>)"
 
@@ -96,13 +98,15 @@ def generate_audio(
         completion_text += chunk_text
         audio_str_secs = audio_tokenizer.get_audio_codes_str_secs(audio_str)
         if audio_str_secs >= 2.0:
-            (_, output_audio), audio_str, _ = audio_tokenizer.detokenize_audio(audio_str)
-            completion_audio = np.concatenate((completion_audio, output_audio.reshape(audio_tokenizer.num_channels, -1)), axis=-1)
+            (_, output_audio), audio_str, _ = audio_tokenizer.detokenize_audio(audio_str, preroll_samples=crossfade_ramps[0])
+            completion_audio = smooth_join(completion_audio, output_audio.reshape(audio_tokenizer.num_channels, -1), *crossfade_ramps)
+            output_audio = completion_audio[..., -output_audio.shape[-1]-crossfade_ramps[0]:-crossfade_ramps[0]]
             outputs = prep_for_output(output_audio, completion_audio, audio_tokenizer.sampling_rate, completion_text, show_all_codes)
             yield outputs
     if len(audio_str) > 0:
-        (_, output_audio), _, _ = audio_tokenizer.detokenize_audio(audio_str)
-        completion_audio = np.concatenate((completion_audio, output_audio.reshape(audio_tokenizer.num_channels, -1)), axis=-1)
+        (_, output_audio), _, _ = audio_tokenizer.detokenize_audio(audio_str, preroll_samples=crossfade_ramps[0])
+        completion_audio = smooth_join(completion_audio, output_audio.reshape(audio_tokenizer.num_channels, -1), *crossfade_ramps)
+        output_audio = completion_audio[..., -output_audio.shape[-1]-crossfade_ramps[0]:-crossfade_ramps[0]]
         outputs = prep_for_output(output_audio, completion_audio, audio_tokenizer.sampling_rate, completion_text, show_all_codes)
         yield outputs
 
@@ -129,6 +133,7 @@ if __name__ == "__main__":
         print("Model is a stereo model, setting --stereo to true")
  
     audio_tokenizer = AudioTokenizer(num_channels = 2 if args.stereo else 1)
+    crossfade_ramps = create_crossfade_ramps(audio_tokenizer.sampling_rate, fade_secs=0.05)
 
     interface = gr.Interface(
         fn=generate_audio,
