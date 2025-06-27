@@ -2,8 +2,10 @@ from typing import Optional
 from fastrtc import StreamHandler, Stream
 from queue import Queue, Empty
 from warnings import warn
+import gradio as gr
 import numpy as np
 import soundfile as sf
+import argparse
 
 from realtime_codec_agent.realtime_agent import RealtimeAgent, RealtimeAgentResources, RealtimeAgentConfig
 from realtime_codec_agent.asr_handler import ASRHandlerMultiprocessing, ASRConfig
@@ -18,6 +20,7 @@ class AgentHandler(StreamHandler):
         self.asr_handler = asr_handler
         self.in_buffer = np.zeros((1, 0), dtype=np.int16)
         self.queue = Queue()
+        self.started = False
 
         if self.asr_handler is None and not self.agent.config.enable_audio_first_transcription:
             warn(
@@ -26,6 +29,8 @@ class AgentHandler(StreamHandler):
             )
 
     def receive(self, frame: tuple[int, np.ndarray]) -> None:
+        if not self.started:
+            return
         _, frame_audio = frame
         self.in_buffer = np.concatenate((self.in_buffer, frame_audio), axis=1)
         if self.in_buffer.shape[-1] >= self.agent.chunk_size_samples:
@@ -63,6 +68,9 @@ class AgentHandler(StreamHandler):
         return AgentHandler(self.agent, self.asr_handler)
 
     def shutdown(self):
+        if not self.started:
+            print(">>> Not Started <<<")
+            return
         audio_first_sequence, text_first_sequence = self.agent.get_sequence_strs()
         with open("output.txt", "w", encoding="utf-8") as f:
             f.write("---------------------------------------------------------------------------------------\n")
@@ -78,22 +86,38 @@ class AgentHandler(StreamHandler):
         audio_history = self.agent.get_audio_history()
         audio_history = (audio_history * 32767.0).astype(np.int16)
         sf.write("output.wav", audio_history.T, self.output_sample_rate)
+        self.started = False
         print(">>> Stopped <<<")
 
     def start_up(self) -> None:
-        self.agent.reset()
+        self.set_config_and_reset()
+        self.started = True
         print(">>> Started <<<")
 
-def main():
+    def set_config_and_reset(self):
+        if not self.phone_mode:
+            self.wait_for_args_sync()
+            config = self.agent.config
+            config.agent_opening_text = self.latest_args[1]
+            config.agent_voice_enrollment = self.latest_args[2]
+            config.agent_voice_enrollment_text = self.latest_args[3]
+            config.chunk_size_secs = float(self.latest_args[4])
+            config.text_first_temperature = float(self.latest_args[5])
+            config.text_first_top_p = float(self.latest_args[6])
+            config.text_first_min_p = float(self.latest_args[7])
+            config.text_first_presence_penalty = float(self.latest_args[8])
+            config.text_first_frequency_penalty = float(self.latest_args[9])
+            config.audio_first_cont_temperature = float(self.latest_args[10])
+            config.audio_first_trans_temperature = float(self.latest_args[11])
+            self.agent.set_config(config)
+        self.agent.reset()
+
+def main(args):
     agent = RealtimeAgent(
-        resources=RealtimeAgentResources(),
-        config=RealtimeAgentConfig(
-            chunk_size_secs=0.1, 
-            #enable_audio_first_transcription=False,
-            text_first_temperature=1.0,
-            text_first_min_p=0.002,
-            text_first_presence_penalty=0.0,
-            text_first_frequency_penalty=0.0,
+        resources=RealtimeAgentResources(
+            tensor_parallel_size = args.tensor_parallel_size,
+            debug = args.debug,
+            mock = args.mock,
         ),
     )
     asr_handler = None
@@ -121,8 +145,26 @@ def main():
         },
         modality="audio", 
         mode="send-receive",
+        additional_inputs=[
+            gr.Textbox("hello my name is alex, how can i help you?", label="Agent Opening Text"),
+            gr.Audio(label="Agent Voice Enrollment"),
+            gr.Textbox(label="Agent Voice Enrollment Text"),
+            gr.Slider(0.02, 1.0, value=0.1, step=0.02, label="Chunk Size (seconds)"),
+            gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Text-First Temperature"),
+            gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Text-First Top-p"),
+            gr.Slider(0.0, 1.0, value=0.002, step=0.001, label="Text-First Min-p"),
+            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Presence Penalty"),
+            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Frequency Penalty"),
+            gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="Audio-First Continuation Temperature"),
+            gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Audio-First Transcription Temperature"),
+        ],
     )
     stream.ui.launch()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run the Realtime Codec Agent with FastRTC.")
+    parser.add_argument("--tensor_parallel_size", type=int, default=2, help="Sets tensor_parallel_size for vLLM (number of GPUs).")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode (starts vLLM in eager mode).")
+    parser.add_argument("--mock", action="store_true", help="Enable mock mode (does not start vLLM, echos input audio).")
+    args = parser.parse_args()
+    main(args)

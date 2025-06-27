@@ -162,6 +162,9 @@ cython_debug/
 # vscode
 .vscode
 
+# gradio
+.gradio
+
 data/audio/*
 !data/audio/readme.md
 data/transcripts/*

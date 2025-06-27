@@ -49,6 +49,21 @@ class AudioTokenizer:
         secs = len(audio_codes_str) / (self.framerate * self.num_channels)
         return secs
 
+    def chunked_tokenize_audio(self, audio: Union[Tuple[int, np.ndarray], np.ndarray], chunk_size_secs: float) -> str:
+        if isinstance(audio, np.ndarray):
+            sr = self.sampling_rate
+        else:
+            sr, audio = audio
+        chunk_size_samples = int(chunk_size_secs * sr)
+        chunk_codes_strs = []
+        for start in range(0, audio.shape[-1], chunk_size_samples):
+            end = start + chunk_size_samples
+            chunk = audio[..., start:end]
+            chunk_codes_str = self.tokenize_audio((sr, chunk))
+            chunk_codes_strs.append(chunk_codes_str)
+        audio_codes_str = "".join(chunk_codes_strs)
+        return audio_codes_str
+
     @torch.inference_mode()
     def tokenize_audio(self, audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
         if isinstance(audio, np.ndarray):

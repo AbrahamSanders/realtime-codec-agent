@@ -40,14 +40,16 @@ class RealtimeAgentResources:
 
 @dataclass
 class RealtimeAgentConfig:
-    user_voice_enrollment: np.ndarray = None
-    user_voice_enrollment_text: str = None
+    agent_opening_text: str = None
+    agent_voice_enrollment: Tuple[int, np.ndarray] = None
+    agent_voice_enrollment_text: str = None
     agent_identity: str = "A"
     user_identity: str = "B"
-    text_first_temperature: float = 0.8
-    text_first_min_p: float = 0.0
-    text_first_presence_penalty: float = 0.5
-    text_first_frequency_penalty: float = 0.5
+    text_first_temperature: float = 1.0
+    text_first_top_p: float = 1.0
+    text_first_min_p: float = 0.002
+    text_first_presence_penalty: float = 0.0
+    text_first_frequency_penalty: float = 0.0
     audio_first_cont_temperature: float = 0.6 
     audio_first_trans_temperature: float = 0.2
     chunk_size_secs: float = 0.1
@@ -68,6 +70,8 @@ class RealtimeAgentConfig:
             raise ValueError("Chunk size must be a multiple of 0.02 seconds.")
         if self.chunk_fade_secs > self.chunk_size_secs:
             raise ValueError("Chunk fade length cannot be longer than the chunk size.")
+        if self.agent_voice_enrollment is not None and not self.agent_voice_enrollment_text:
+            raise ValueError("If agent_voice_enrollment is provided, agent_voice_enrollment_text must also be provided.")
 
 @dataclass
 class GenerateParams:
@@ -92,31 +96,37 @@ class RealtimeAgent:
         common_header = f"{c.header_speaker_token}{c.agent_identity}{c.header_speaker_token}{c.user_identity}{c.end_header_token}"
         audio_first_prompt = f"{c.audio_first_token}{common_header}"
         text_first_prompt = f"{c.text_first_token}{common_header}"
-        if self.config.user_voice_enrollment is not None:
-            silence_audio_str = self.resources.audio_tokenizer.tokenize_audio(np.zeros_like(self.config.user_voice_enrollment))
-            enrollment_audio_str = self.resources.audio_tokenizer.tokenize_audio(self.config.user_voice_enrollment)
+        if c.agent_voice_enrollment is not None:
+            silence_audio = (c.agent_voice_enrollment[0], np.zeros_like(c.agent_voice_enrollment[1]))
+            silence_audio_str = self.resources.audio_tokenizer.chunked_tokenize_audio(silence_audio, c.chunk_size_secs)
+            enrollment_audio_str = self.resources.audio_tokenizer.chunked_tokenize_audio(c.agent_voice_enrollment, c.chunk_size_secs)
             enrollment_audio_str = "".join(list(itertools.chain.from_iterable(zip(*[enrollment_audio_str, silence_audio_str]))))
 
-            audio_first_prompt += f"{c.start_audio_token}{enrollment_audio_str}{c.end_audio_token} {c.user_identity}: {c.user_voice_enrollment_text}{c.start_audio_token}"
-            text_first_prompt +=  f" {c.user_identity}: {c.user_voice_enrollment_text}{c.start_audio_token}{enrollment_audio_str}"
+            audio_first_prompt += f"{c.start_audio_token}{enrollment_audio_str}{c.end_audio_token} {c.agent_identity}: {c.agent_voice_enrollment_text}{c.start_audio_token}"
+            text_first_prompt +=  f" {c.agent_identity}: {c.agent_voice_enrollment_text}{c.start_audio_token}{enrollment_audio_str}"
+            text_first_audio_start = False
         else:
             audio_first_prompt += c.start_audio_token
             text_first_prompt += c.start_audio_token
+            text_first_audio_start = True
 
         self.audio_first_input_ids = self.resources.tokenizer(audio_first_prompt, return_tensors="pt").input_ids
         self.text_first_input_ids = self.resources.tokenizer(text_first_prompt, return_tensors="pt").input_ids
         self.audio_first_trim_pos = self.audio_first_input_ids.shape[-1]-1
-        self.text_first_trim_pos = self.text_first_input_ids.shape[-1]-1
+        self.text_first_trim_pos = self.text_first_input_ids.shape[-1]-1 if text_first_audio_start else self.text_first_input_ids.shape[-1]
 
-        self.text_first_input_ids = torch.cat(
-            [
-                self.text_first_input_ids[..., :-1], 
-                self.resources.tokenizer(f" {c.agent_identity}: hi my name is alex how are you?", return_tensors="pt", add_special_tokens=False).input_ids,
-                torch.LongTensor([[self.start_audio_token_id]]),
-            ], 
-            dim=1,
-        )
-        self.text_first_trans_pos = self.text_first_input_ids.shape[-1]-1
+        if c.agent_opening_text:
+            opening_prompt = "" if text_first_audio_start else c.end_audio_token
+            opening_prompt += f" {c.agent_identity}: {c.agent_opening_text}{c.start_audio_token}"
+            self.text_first_input_ids = torch.cat(
+                [
+                    self.text_first_input_ids[..., :-1] if text_first_audio_start else self.text_first_input_ids,
+                    self.resources.tokenizer(opening_prompt, return_tensors="pt", add_special_tokens=False).input_ids,
+                ], 
+                dim=1,
+            )
+            text_first_audio_start = True
+        self.text_first_trans_pos = self.text_first_input_ids.shape[-1]-1 if text_first_audio_start else self.text_first_input_ids.shape[-1]
 
         self.generated_tokens = 0
         self.generated_audio_tokens = 0
@@ -190,6 +200,7 @@ class RealtimeAgent:
                             SamplingParams(
                                 max_tokens=max_tokens, 
                                 temperature=self.config.text_first_temperature, 
+                                top_p=self.config.text_first_top_p,
                                 min_p=self.config.text_first_min_p,
                                 presence_penalty=self.config.text_first_presence_penalty, 
                                 frequency_penalty=self.config.text_first_frequency_penalty, 
@@ -208,6 +219,7 @@ class RealtimeAgent:
                             SamplingParams(
                                 max_tokens=max_tokens, 
                                 temperature=self.config.text_first_temperature, 
+                                top_p=self.config.text_first_top_p,
                                 min_p=self.config.text_first_min_p,
                                 presence_penalty=self.config.text_first_presence_penalty, 
                                 frequency_penalty=self.config.text_first_frequency_penalty, 
@@ -233,6 +245,7 @@ class RealtimeAgent:
                         SamplingParams(
                             max_tokens=max_tokens, 
                             temperature=self.config.text_first_temperature, 
+                            top_p=self.config.text_first_top_p,
                             min_p=self.config.text_first_min_p,
                             presence_penalty=self.config.text_first_presence_penalty, 
                             frequency_penalty=self.config.text_first_frequency_penalty, 
@@ -263,6 +276,7 @@ class RealtimeAgent:
                     SamplingParams(
                         max_tokens=max_tokens, 
                         temperature=self.config.text_first_temperature, 
+                        top_p=self.config.text_first_top_p,
                         min_p=self.config.text_first_min_p,
                         presence_penalty=self.config.text_first_presence_penalty, 
                         frequency_penalty=self.config.text_first_frequency_penalty, 
