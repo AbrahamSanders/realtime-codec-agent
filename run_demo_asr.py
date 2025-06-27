@@ -5,7 +5,7 @@ from openai import OpenAI
 
 from realtime_codec_agent.audio_tokenizer import AudioTokenizer
 from realtime_codec_agent.utils.vllm_utils import get_vllm_modelname
-from run_demo_bpe_xcodec2 import prep_for_output
+from run_demo import prep_for_output
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,9 @@ def generate_transcript(
     min_p, 
 ):
     audio_tokenizer.reset_context()
+    sr, audio = audio
+    if audio.ndim > 1:
+        audio = audio.T
     
     sequence = "<|audio_first|>"
     sequence += "".join([f"<|speaker|>{chr(ord('A') + i % 26)}" for i in range(num_speakers)])
@@ -37,15 +40,11 @@ def generate_transcript(
     }
     if float(min_p) > 0.0:
         extra_body["min_p"] = float(min_p)
-    chunk_size_secs = 0.3
-    sr, audio = audio
-    if audio.ndim > 1:
-        audio = audio.T
+    chunk_size_secs = 0.1
+    chunk_size_samples = int(chunk_size_secs*sr)
     transcribe_after = None
     start = 0
     while start < audio.shape[-1]:
-        chunk_size_secs_ = audio_tokenizer.context_secs if start == 0 else chunk_size_secs
-        chunk_size_samples = int(chunk_size_secs_*sr)
         # tokenize next audio chunk
         audio_chunk = (sr, audio[..., start:start+chunk_size_samples])
         input_audio_str = audio_tokenizer.tokenize_audio(audio_chunk)

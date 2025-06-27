@@ -3,7 +3,7 @@ import numpy as np
 from tqdm import tqdm
 from codec_bpe.core.utils import get_codec_info
 
-codes_path = "data/audio/codes/xcodec2/mono"
+codes_path = "data/audio/codes/MagiCodec-50Hz-Base/0.1s_2.0s/mono"
 codec_info = get_codec_info(codes_path)
 framerate = codec_info["framerate"]
 print(f"Framerate: {framerate} Hz")

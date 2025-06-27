@@ -1,5 +1,5 @@
 accelerate
-codec-bpe[xcodec2]
+codec-bpe[magicodec]
 datasets
 evaluate
 gradio
@@ -8,6 +8,7 @@ librosa
 matplotlib
 numpy
 openai
+openai-whisper
 pylangacq
 requests
 scipy

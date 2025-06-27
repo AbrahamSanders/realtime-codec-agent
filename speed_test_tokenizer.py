@@ -6,18 +6,18 @@ from tqdm import trange
 from realtime_codec_agent.audio_tokenizer import AudioTokenizer
 from realtime_codec_agent.utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
 
-audio_tokenizer = AudioTokenizer(context_secs=2.0)
+audio_tokenizer = AudioTokenizer()
 
 audio_file = "experimental/audio (4) (1).wav"
 audio, _ = librosa.load(audio_file, sr=audio_tokenizer.sampling_rate, mono=True)
 
-chunk_size_secs = 0.24
+chunk_size_secs = 0.1
 if int(chunk_size_secs*100) % 2 != 0:
     raise ValueError("Chunk size must be a multiple of 0.02 seconds.")
 chunk_size_samples = int(chunk_size_secs * audio_tokenizer.sampling_rate)
 out_audio = np.zeros((0,), dtype=np.float32)
 
-crossfade_ramps = create_crossfade_ramps(audio_tokenizer.sampling_rate, fade_secs=0.05) 
+crossfade_ramps = create_crossfade_ramps(audio_tokenizer.sampling_rate, fade_secs=0.02) 
 
 start_time = time.time()
 for start in trange(0, len(audio), chunk_size_samples, desc="Chunks"):

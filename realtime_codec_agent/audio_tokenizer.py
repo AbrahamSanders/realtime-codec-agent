@@ -3,45 +3,37 @@ import librosa
 import numpy as np
 import itertools
 import math
-from huggingface_hub import hf_hub_download
-from typing import Optional, Tuple, Union
-from safetensors import safe_open
+from typing import Optional, Tuple, Union, Any
 from codec_bpe import codes_to_chars, chars_to_codes, UNICODE_OFFSET_LARGE
-from xcodec2.modeling_xcodec2 import XCodec2Model
-from xcodec2.configuration_bigcodec import BigCodecConfig
+from codec_bpe.tools.codec_utils import load_magicodec_model
 
 class AudioTokenizer:
     def __init__(
         self, 
-        codec_model: Union[str, XCodec2Model] = "HKUSTAudio/xcodec2", 
+        codec_model: Union[str, Any] = "MagiCodec-50Hz-Base", 
         num_channels: int = 1, 
-        num_codebooks: int = 1,
-        codebook_size: int = 65536,
-        context_secs: float = 3.0,
+        context_secs: float = 2.0,
         unicode_offset: int = UNICODE_OFFSET_LARGE,
         device: Optional[Union[str, torch.device]] = None, 
     ):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
         self.device = device
+        self.autocast_bfloat16 = self.device.type == "cuda" and torch.cuda.is_bf16_supported()
 
         if isinstance(codec_model, str):
-            ckpt_path = hf_hub_download(repo_id=codec_model, filename="model.safetensors")
-            ckpt = {}
-            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
-                for k in f.keys():
-                    ckpt[k.replace(".beta", ".bias")] = f.get_tensor(k)
-            codec_config = BigCodecConfig.from_pretrained(codec_model)
-            codec_model = XCodec2Model.from_pretrained(None, config=codec_config, state_dict=ckpt)
+            codec_model, _, _ = load_magicodec_model(codec_model, self.device)
         self.codec_model = codec_model.eval().to(self.device)
 
         self.num_channels = num_channels
-        self.num_codebooks = num_codebooks
-        self.codebook_size = codebook_size
+        self.num_codebooks = 1
+        self.codebook_size = self.codec_model.codebook_size
         self.context_secs = context_secs
         self.unicode_offset = unicode_offset
 
-        self.sampling_rate = self.codec_model.feature_extractor.sampling_rate
+        self.sampling_rate = self.codec_model.sample_rate
         self.framerate = self._compute_framerate()
 
         self.context_samples = int(self.context_secs * self.sampling_rate)
@@ -57,6 +49,7 @@ class AudioTokenizer:
         secs = len(audio_codes_str) / (self.framerate * self.num_channels)
         return secs
 
+    @torch.inference_mode()
     def tokenize_audio(self, audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
         if isinstance(audio, np.ndarray):
             orig_sr = self.sampling_rate
@@ -77,10 +70,15 @@ class AudioTokenizer:
         
         # get audio codes
         input_audio = torch.tensor(self.tokenize_context).to(self.device)
-        encoder_outputs = torch.cat(
-            [self.codec_model.encode_code(channel.unsqueeze(0), sample_rate=self.sampling_rate) for channel in input_audio], 
-            dim=0,
-        )
+        with torch.autocast(
+            device_type = "cuda",
+            dtype = torch.bfloat16,
+            enabled = self.autocast_bfloat16,
+        ):
+            encoder_outputs = torch.cat(
+                [self._magicodec_encode(channel.unsqueeze(0)) for channel in input_audio], 
+                dim=0,
+            )
 
         # convert to unicode string
         channels_chars = [
@@ -99,7 +97,8 @@ class AudioTokenizer:
 
         return audio_codes_str
 
-    def detokenize_audio(self, audio_codes_str: str, preroll_samples: int = 0) -> Tuple[Tuple[int, np.ndarray], str]:
+    @torch.inference_mode()
+    def detokenize_audio(self, audio_codes_str: str, preroll_samples: int = 0) -> Tuple[Tuple[int, np.ndarray], str, int]:
         # make sure len(audio_codes_str) is divisible by num_channels
         audio_codes_str, end_hanging = self._drop_hanging_channel_codes(audio_codes_str)
         
@@ -124,10 +123,15 @@ class AudioTokenizer:
         input_audio_codes = torch.stack(input_audio_codes).to(self.device)
         
         # decode audio codes with codec
-        output_audio = torch.cat(
-            [self.codec_model.decode_code(ch_codes.unsqueeze(0)) for ch_codes in input_audio_codes], 
-            dim=1,
-        )
+        with torch.autocast(
+            device_type = "cuda",
+            dtype = torch.bfloat16,
+            enabled = self.autocast_bfloat16,
+        ):
+            output_audio = torch.cat(
+                [self._magicodec_decode(ch_codes.unsqueeze(0)) for ch_codes in input_audio_codes], 
+                dim=1,
+            )
 
         # discard context audio that comes before the codes we are detokenizing
         audio_secs = self.get_audio_codes_str_secs(audio_codes_str)
@@ -148,9 +152,29 @@ class AudioTokenizer:
             end_hanging = ""
         return audio_str, end_hanging
     
+    @torch.inference_mode()
     def _compute_framerate(self) -> float:
         audio = torch.zeros(10 * self.sampling_rate).to(self.device)
-        audio_codes = self.codec_model.encode_code(audio.unsqueeze(0), sample_rate=self.sampling_rate)
+        with torch.autocast(
+            device_type = "cuda",
+            dtype = torch.bfloat16,
+            enabled = self.autocast_bfloat16,
+        ):
+            audio_codes = self._magicodec_encode(audio.unsqueeze(0))
         samples_per_frame = math.ceil(audio.shape[-1] / audio_codes.shape[-1])
         framerate = self.sampling_rate / samples_per_frame
         return framerate
+
+    def _magicodec_encode(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.codec_model.pad_audio(x)
+        z_e = self.codec_model.encoder(x)
+        _, quantized_indices = self.codec_model.quantizer.inference(z_e)
+        quantized_indices = quantized_indices.unsqueeze(1) # add codebook dimension
+        return quantized_indices
+    
+    def _magicodec_decode(self, codes: torch.Tensor) -> torch.Tensor:
+        codes = codes.squeeze(1) # remove codebook dimension
+        codebook = self.codec_model.quantizer.codebook_proj(self.codec_model.quantizer.codebook.weight)
+        z_q = torch.nn.functional.embedding(codes, codebook)
+        recon = self.codec_model.decoder(z_q).float()
+        return recon

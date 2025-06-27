@@ -7,7 +7,7 @@ from openai import OpenAI
 
 from realtime_codec_agent.audio_tokenizer import AudioTokenizer
 from realtime_codec_agent.utils.vllm_utils import get_vllm_modelname
-from realtime_codec_agent.utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
+from realtime_codec_agent.utils.audio_utils import smooth_join, create_crossfade_ramps
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,8 @@ def generate_audio(
         top_p=float(top_p),
         extra_body=extra_body,
         stream=True,
+        # presence_penalty=0.5,
+        # frequency_penalty=0.5,
     )
 
     completion_text = ""
@@ -133,7 +135,7 @@ if __name__ == "__main__":
         print("Model is a stereo model, setting --stereo to true")
  
     audio_tokenizer = AudioTokenizer(num_channels = 2 if args.stereo else 1)
-    crossfade_ramps = create_crossfade_ramps(audio_tokenizer.sampling_rate, fade_secs=0.05)
+    crossfade_ramps = create_crossfade_ramps(audio_tokenizer.sampling_rate, fade_secs=0.02)
 
     interface = gr.Interface(
         fn=generate_audio,

@@ -14,8 +14,8 @@ from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
 class RealtimeAgentResources:
     def __init__(
         self, 
-        vllm_model: str = "Llama-3.2-3B-xcodec2-no-bpe-multi-66k-stereo", 
-        xcodec2_model: str = "HKUSTAudio/xcodec2", 
+        vllm_model: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo", 
+        codec_model: str = "MagiCodec-50Hz-Base", 
         device: Union[str, torch.device] = None,
         tensor_parallel_size: int = 2,
         gpu_memory_utilization: float = 0.7,
@@ -33,7 +33,7 @@ class RealtimeAgentResources:
                 enforce_eager=debug,
             )
         self.tokenizer = AutoTokenizer.from_pretrained(vllm_model)
-        self.audio_tokenizer = AudioTokenizer(codec_model=xcodec2_model, device=device, context_secs=2.0)
+        self.audio_tokenizer = AudioTokenizer(codec_model=codec_model, device=device)
 
     def create_agent(self, config=None):
         return RealtimeAgent(resources=self, config=config)
@@ -45,12 +45,13 @@ class RealtimeAgentConfig:
     agent_identity: str = "A"
     user_identity: str = "B"
     text_first_temperature: float = 0.8
+    text_first_min_p: float = 0.0
     text_first_presence_penalty: float = 0.5
     text_first_frequency_penalty: float = 0.5
     audio_first_cont_temperature: float = 0.6 
     audio_first_trans_temperature: float = 0.2
-    chunk_size_secs: float = 0.7
-    chunk_fade_secs: float = 0.05
+    chunk_size_secs: float = 0.1
+    chunk_fade_secs: float = 0.02
     max_seq_length: int = 4096
     trim_by: int = 1024
     seed: Optional[int] = None
@@ -60,6 +61,7 @@ class RealtimeAgentConfig:
     end_header_token: str = "<|end_header|>"
     start_audio_token: str = "<|audio|>"
     end_audio_token: str = "<|end_audio|>"
+    enable_audio_first_transcription: bool = True
 
     def __post_init__(self):
         if int(self.chunk_size_secs*100) % 2 != 0:
@@ -104,16 +106,17 @@ class RealtimeAgent:
         self.audio_first_input_ids = self.resources.tokenizer(audio_first_prompt, return_tensors="pt").input_ids
         self.text_first_input_ids = self.resources.tokenizer(text_first_prompt, return_tensors="pt").input_ids
         self.audio_first_trim_pos = self.audio_first_input_ids.shape[-1]-1
-        self.text_first_trim_pos = self.text_first_trans_pos = self.text_first_input_ids.shape[-1]-1
+        self.text_first_trim_pos = self.text_first_input_ids.shape[-1]-1
 
         self.text_first_input_ids = torch.cat(
             [
                 self.text_first_input_ids[..., :-1], 
-                self.resources.tokenizer(f" {c.agent_identity}: hi my name is alex how are you?", return_tensors="pt").input_ids,
+                self.resources.tokenizer(f" {c.agent_identity}: hi my name is alex how are you?", return_tensors="pt", add_special_tokens=False).input_ids,
                 torch.LongTensor([[self.start_audio_token_id]]),
             ], 
             dim=1,
         )
+        self.text_first_trans_pos = self.text_first_input_ids.shape[-1]-1
 
         self.generated_tokens = 0
         self.generated_audio_tokens = 0
@@ -168,31 +171,52 @@ class RealtimeAgent:
         return next_token_ids
 
     def generate_for_mode(self, mode: str) -> Tuple[Optional[torch.LongTensor], Optional[torch.LongTensor], int]:
+        # TODO: clean up this awful mess
         max_tokens = 100 if "text" in mode else 1
         if mode == "audio" or mode == "force_audio":
             logit_bias = {self.end_audio_token_id: -100} if mode == "force_audio" else None
-            audio_first_next_tokens, text_first_next_tokens = self.generate(
-                [
-                    GenerateParams(
-                        self.audio_first_input_ids, 
-                        SamplingParams(
-                            max_tokens=max_tokens, 
-                            temperature=self.config.audio_first_cont_temperature,
+            if self.config.enable_audio_first_transcription:
+                audio_first_next_tokens, text_first_next_tokens = self.generate(
+                    [
+                        GenerateParams(
+                            self.audio_first_input_ids, 
+                            SamplingParams(
+                                max_tokens=max_tokens, 
+                                temperature=self.config.audio_first_cont_temperature,
+                            ),
                         ),
-                    ),
-                    GenerateParams(
-                        self.text_first_input_ids, 
-                        SamplingParams(
-                            max_tokens=max_tokens, 
-                            temperature=self.config.text_first_temperature, 
-                            presence_penalty=self.config.text_first_presence_penalty, 
-                            frequency_penalty=self.config.text_first_frequency_penalty, 
-                            logit_bias=logit_bias,
+                        GenerateParams(
+                            self.text_first_input_ids, 
+                            SamplingParams(
+                                max_tokens=max_tokens, 
+                                temperature=self.config.text_first_temperature, 
+                                min_p=self.config.text_first_min_p,
+                                presence_penalty=self.config.text_first_presence_penalty, 
+                                frequency_penalty=self.config.text_first_frequency_penalty, 
+                                logit_bias=logit_bias,
+                            ),
                         ),
-                    ),
-                ]
-            )
-            generated_tokens = audio_first_next_tokens.shape[-1] + text_first_next_tokens.shape[-1]
+                    ]
+                )
+                generated_tokens = audio_first_next_tokens.shape[-1] + text_first_next_tokens.shape[-1]
+            else:
+                audio_first_next_tokens = torch.LongTensor([[self.start_audio_token_id]])
+                text_first_next_tokens = self.generate(
+                    [
+                        GenerateParams(
+                            self.text_first_input_ids, 
+                            SamplingParams(
+                                max_tokens=max_tokens, 
+                                temperature=self.config.text_first_temperature, 
+                                min_p=self.config.text_first_min_p,
+                                presence_penalty=self.config.text_first_presence_penalty, 
+                                frequency_penalty=self.config.text_first_frequency_penalty, 
+                                logit_bias=logit_bias,
+                            ),
+                        ),
+                    ]
+                )
+                generated_tokens = text_first_next_tokens.shape[-1]
         elif mode == "both_text":
             audio_first_next_tokens, text_first_next_tokens = self.generate(
                 [
@@ -209,6 +233,7 @@ class RealtimeAgent:
                         SamplingParams(
                             max_tokens=max_tokens, 
                             temperature=self.config.text_first_temperature, 
+                            min_p=self.config.text_first_min_p,
                             presence_penalty=self.config.text_first_presence_penalty, 
                             frequency_penalty=self.config.text_first_frequency_penalty, 
                             stop_token_ids=[self.start_audio_token_id], 
@@ -238,6 +263,7 @@ class RealtimeAgent:
                     SamplingParams(
                         max_tokens=max_tokens, 
                         temperature=self.config.text_first_temperature, 
+                        min_p=self.config.text_first_min_p,
                         presence_penalty=self.config.text_first_presence_penalty, 
                         frequency_penalty=self.config.text_first_frequency_penalty, 
                         stop_token_ids=[self.start_audio_token_id], 
@@ -317,10 +343,49 @@ class RealtimeAgent:
                             mode = "audio"
         return out_chunk_input_ids
 
-    def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
+    def inject_transcription_chunk(self, trans_chunk: str):
+        if not trans_chunk or not trans_chunk.startswith("*"):
+            return
+        trans_chunk = trans_chunk[1:].lower().replace(".", "").strip()
+        if not trans_chunk:
+            return
+        
+        # heuristic: 2.5 words spoken per second plus an additional chunk length for buffering
+        num_words = trans_chunk.count(" ") + 1
+        trans_secs = (num_words / 2.5) + self.config.chunk_size_secs
+        trans_frames = int(trans_secs * self.resources.audio_tokenizer.framerate * 2)
+        # compute the position to inject the trancription chunk
+        trans_pos = max(self.text_first_input_ids.shape[-1] - trans_frames, self.text_first_trans_pos)
+        # check if we're in the middle of a text segment and if so move to the end of it
+        token_ord = ord(self.resources.tokenizer.decode(self.text_first_input_ids[0, trans_pos], skip_special_tokens=False)[0])
+        if token_ord < self.resources.audio_tokenizer.unicode_offset:
+            # move to the next start audio token
+            while trans_pos < self.text_first_input_ids.shape[-1] and self.text_first_input_ids[0, trans_pos] != self.start_audio_token_id:
+                trans_pos += 1
+        
+        trans_chunk = f" {self.config.user_identity}: {trans_chunk}"
+        print(f"Injecting: '{trans_chunk}'")
+        trans_chunk_input_ids = self.resources.tokenizer(trans_chunk, add_special_tokens=False, return_tensors="pt").input_ids
+        add_control_tokens = self.text_first_input_ids[0, trans_pos] != self.start_audio_token_id
+        audio_start_id = torch.LongTensor([[self.start_audio_token_id]]) if add_control_tokens else torch.LongTensor([[]])
+        audio_end_id = torch.LongTensor([[self.end_audio_token_id]]) if add_control_tokens else torch.LongTensor([[]])
+        self.text_first_input_ids = torch.cat(
+            [
+                self.text_first_input_ids[..., :trans_pos],
+                audio_end_id, 
+                trans_chunk_input_ids,
+                audio_start_id,
+                self.text_first_input_ids[..., trans_pos:]
+            ], 
+            dim=1,
+        )
+
+    def process_audio(self, audio_chunk: np.ndarray, trans_chunk: Optional[str] = None) -> np.ndarray:
         # Sanity check - input size
         if audio_chunk.shape[-1] != self.chunk_size_samples:
             raise ValueError(f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}")
+
+        self.inject_transcription_chunk(trans_chunk)
 
         # Encode audio chunk to input ids
         audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)

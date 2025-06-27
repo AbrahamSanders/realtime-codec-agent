@@ -7,7 +7,7 @@ from openai import OpenAI
 
 from realtime_codec_agent.audio_tokenizer import AudioTokenizer
 from realtime_codec_agent.utils.vllm_utils import get_vllm_modelname
-from run_demo_bpe_xcodec2 import prep_for_output
+from run_demo import prep_for_output
 
 logger = logging.getLogger(__name__)
 

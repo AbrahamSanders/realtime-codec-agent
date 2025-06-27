@@ -121,7 +121,7 @@ def generate_for_mode(llm, audio_first_input_ids, text_first_input_ids, mode, st
     return audio_first_next_tokens, text_first_next_tokens, generated_tokens
 
 if __name__ == "__main__":
-    model_name = "Llama-3.2-3B-xcodec2-no-bpe-multi-66k-stereo"
+    model_name = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     llm = LLM(
         model=model_name, 
@@ -134,13 +134,13 @@ if __name__ == "__main__":
         # },
     )
 
-    audio_tokenizer = AudioTokenizer(context_secs=2.0)
+    audio_tokenizer = AudioTokenizer()
 
     audio_file = "experimental/audio (4) (1).wav"
     audio, _ = librosa.load(audio_file, sr=audio_tokenizer.sampling_rate, mono=False)
     audio = audio[0]
 
-    chunk_size_secs = 0.24
+    chunk_size_secs = 0.1
     if int(chunk_size_secs*100) % 2 != 0:
         raise ValueError("Chunk size must be a multiple of 0.02 seconds.")
     chunk_size_samples = int(chunk_size_secs * audio_tokenizer.sampling_rate)
@@ -148,7 +148,7 @@ if __name__ == "__main__":
     audio_first_trim_by = 1024
     text_first_max_seq_length = 4096
     text_first_trim_by = 1024
-    crossfade_ramps = create_crossfade_ramps(audio_tokenizer.sampling_rate, fade_secs=0.05)
+    crossfade_ramps = create_crossfade_ramps(audio_tokenizer.sampling_rate, fade_secs=0.02)
 
     audio_first_prompt = "<|audio_first|><|speaker|>A<|speaker|>B<|end_header|><|audio|>"
     audio_first_input_ids = tokenizer(audio_first_prompt, return_tensors="pt").input_ids

@@ -5,6 +5,7 @@ from enum import Enum
 import numpy as np
 import os
 import itertools
+import re
 
 from codec_bpe.core.converter import codes_to_chars, UNICODE_OFFSET
 from codec_bpe.core.utils import get_codes_files
@@ -68,9 +69,12 @@ class LMDatasetBuilder:
         grouped_codes_files = []
         last_file_root = None
         for codes_file in codes_files:
-            codes_file_parts = codes_file.split("_")
-            file_root = "_".join(codes_file_parts[:-2])
-            channel = int(codes_file_parts[-2].lstrip("c"))
+            codes_file_info = re.match(r"(.+)_c(\d+)[_.]", codes_file)
+            if not codes_file_info:
+                raise ValueError(
+                    f"Invalid codes file name format: {codes_file}. Expected format: *_c<channel>.npy or *_c<channel>_<timestamp>.npy"
+                )
+            file_root, channel = codes_file_info.group(1), int(codes_file_info.group(2))
             if file_root != last_file_root:
                 grouped_codes_files.append((file_root, []))
                 last_file_root = file_root
