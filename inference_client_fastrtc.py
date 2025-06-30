@@ -1,7 +1,8 @@
 from typing import Optional
-from fastrtc import StreamHandler, Stream
+from fastrtc import StreamHandler, Stream, AdditionalOutputs
 from queue import Queue, Empty
 from warnings import warn
+from datetime import datetime
 import gradio as gr
 import numpy as np
 import soundfile as sf
@@ -11,16 +12,20 @@ from realtime_codec_agent.realtime_agent import RealtimeAgent, RealtimeAgentReso
 from realtime_codec_agent.asr_handler import ASRHandlerMultiprocessing, ASRConfig
 
 class AgentHandler(StreamHandler):
-    def __init__(self, agent: RealtimeAgent, asr_handler: Optional[ASRHandlerMultiprocessing] = None):
+    def __init__(self, agent: RealtimeAgent, asr_handler: Optional[ASRHandlerMultiprocessing] = None, report_interval_secs: float = 1.0):
         super().__init__(
             input_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
             output_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
         )
         self.agent = agent
         self.asr_handler = asr_handler
+        self.report_interval_secs = report_interval_secs
         self.in_buffer = np.zeros((1, 0), dtype=np.int16)
         self.queue = Queue()
         self.started = False
+        self.realtime_factor_sum = 0.0
+        self.report_chunk_count = 0
+        self.last_report_time = datetime.now()
 
         if self.asr_handler is None and not self.agent.config.enable_audio_first_transcription:
             warn(
@@ -45,6 +50,8 @@ class AgentHandler(StreamHandler):
         except Empty:
             return None
         
+        start_time = datetime.now()
+        
         # Suppress low amplitude noise from the microphone
         if np.abs(chunk).max() < 100:
             chunk = np.zeros_like(chunk)
@@ -62,6 +69,21 @@ class AgentHandler(StreamHandler):
         out_chunk = np.expand_dims((out_chunk * 32767.0).astype(np.int16), axis=0)
         
         print(f'Data from model:{out_chunk.shape, out_chunk.dtype, out_chunk.min(), out_chunk.max()}')
+
+        # Compute info for reporting
+        end_time = datetime.now()
+        elapsed_secs = (end_time - start_time).total_seconds()
+        self.realtime_factor_sum += self.agent.config.chunk_size_secs / elapsed_secs
+        self.report_chunk_count += 1
+
+        # Report if enough time has passed
+        if (end_time - self.last_report_time).total_seconds() >= self.report_interval_secs:
+            realtime_factor = self.realtime_factor_sum / self.report_chunk_count
+            self.realtime_factor_sum = 0.0
+            self.report_chunk_count = 0
+            self.last_report_time = end_time
+            return (self.output_sample_rate, out_chunk), AdditionalOutputs(f"{realtime_factor:.2f}x")
+        
         return (self.output_sample_rate, out_chunk)
 
     def copy(self):
@@ -109,8 +131,17 @@ class AgentHandler(StreamHandler):
             config.text_first_frequency_penalty = float(self.latest_args[9])
             config.audio_first_cont_temperature = float(self.latest_args[10])
             config.audio_first_trans_temperature = float(self.latest_args[11])
+            config.max_seq_length = int(self.latest_args[12])
+            config.trim_by = int(self.latest_args[13])
+
+            if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
+                config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
+
             self.agent.set_config(config)
         self.agent.reset()
+
+def display_handler(component1, realtime_factor: str):
+    return realtime_factor
 
 def main(args):
     agent = RealtimeAgent(
@@ -118,6 +149,9 @@ def main(args):
             tensor_parallel_size = args.tensor_parallel_size,
             debug = args.debug,
             mock = args.mock,
+        ),
+        config=RealtimeAgentConfig(
+            enable_audio_first_transcription = not args.whisper,
         ),
     )
     asr_handler = None
@@ -157,7 +191,13 @@ def main(args):
             gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Frequency Penalty"),
             gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="Audio-First Continuation Temperature"),
             gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Audio-First Transcription Temperature"),
+            gr.Number(4096, minimum=512, maximum=8192, precision=0, label="Max Sequence Length (tokens)"),
+            gr.Number(1024, minimum=128, maximum=2048, precision=0, label="Trim By (tokens)"),
         ],
+        additional_outputs=[
+            gr.Textbox(label="Realtime Factor"),
+        ],
+        additional_outputs_handler=display_handler,
     )
     stream.ui.launch()
 
@@ -166,5 +206,6 @@ if __name__ == "__main__":
     parser.add_argument("--tensor_parallel_size", type=int, default=2, help="Sets tensor_parallel_size for vLLM (number of GPUs).")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (starts vLLM in eager mode).")
     parser.add_argument("--mock", action="store_true", help="Enable mock mode (does not start vLLM, echos input audio).")
+    parser.add_argument("--whisper", action="store_true", help="Use Whisper for ASR instead of native audio-first transcription.")
     args = parser.parse_args()
     main(args)
