@@ -35,3 +35,12 @@ def pad_or_trim(chunk: np.ndarray, target_length: int, pad_side: str = "right") 
         return chunk[..., :target_length]
     else:
         return chunk
+    
+def normalize_audio_rms(audio, target_rms=0.05, silence_rms_threshold=0.003):
+    # Compute current RMS
+    rms = np.sqrt(np.mean(audio ** 2))
+    if rms < silence_rms_threshold:
+        # Silent audio, nothing to normalize
+        return audio
+    # Scale so RMS becomes target_rms
+    return audio * (target_rms / rms)

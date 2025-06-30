@@ -8,7 +8,7 @@ from vllm import LLM, SamplingParams, TokensPrompt
 from dataclasses import dataclass
 
 from .audio_tokenizer import AudioTokenizer
-from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
+from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
 
 
 class RealtimeAgentResources:
@@ -56,6 +56,7 @@ class RealtimeAgentConfig:
     chunk_fade_secs: float = 0.02
     max_seq_length: int = 4096
     trim_by: int = 1024
+    target_volume_rms: float = 0.03
     seed: Optional[int] = None
     audio_first_token: str = "<|audio_first|>"
     text_first_token: str = "<|text_first|>"
@@ -416,6 +417,8 @@ class RealtimeAgent:
         out_chunk_str = self.resources.tokenizer.decode(out_chunk_input_ids[0], skip_special_tokens=False)
         (_, out_chunk), _, preroll_samples = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str, preroll_samples=self.crossfade_ramps[0])
         out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
+        if self.config.target_volume_rms > 0:
+            out_chunk = normalize_audio_rms(out_chunk, target_rms=self.config.target_volume_rms)
         self.audio_history_ch1 = smooth_join(self.audio_history_ch1, out_chunk, *self.crossfade_ramps)
         self.audio_history_ch2 = np.concatenate((self.audio_history_ch2, audio_chunk), axis=-1)
 

@@ -133,6 +133,7 @@ class AgentHandler(StreamHandler):
             config.audio_first_trans_temperature = float(self.latest_args[11])
             config.max_seq_length = int(self.latest_args[12])
             config.trim_by = int(self.latest_args[13])
+            config.target_volume_rms = float(self.latest_args[14])
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -193,6 +194,7 @@ def main(args):
             gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Audio-First Transcription Temperature"),
             gr.Number(4096, minimum=512, maximum=8192, precision=0, label="Max Sequence Length (tokens)"),
             gr.Number(1024, minimum=128, maximum=2048, precision=0, label="Trim By (tokens)"),
+            gr.Slider(0.0, 0.1, value=0.03, step=0.01, label="Volume Normalization (0 to disable)"),
         ],
         additional_outputs=[
             gr.Textbox(label="Realtime Factor"),
