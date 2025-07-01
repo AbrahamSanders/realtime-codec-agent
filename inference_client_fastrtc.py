@@ -8,7 +8,7 @@ import numpy as np
 import soundfile as sf
 import argparse
 
-from realtime_codec_agent.realtime_agent import RealtimeAgent, RealtimeAgentResources, RealtimeAgentConfig
+from realtime_codec_agent.realtime_agent import RealtimeAgent, RealtimeAgentResources, RealtimeAgentConfig, AUDIO_FIRST_TRANSCRIPTION_MODES
 from realtime_codec_agent.asr_handler import ASRHandlerMultiprocessing, ASRConfig
 
 class AgentHandler(StreamHandler):
@@ -27,7 +27,7 @@ class AgentHandler(StreamHandler):
         self.report_chunk_count = 0
         self.last_report_time = datetime.now()
 
-        if self.asr_handler is None and not self.agent.config.enable_audio_first_transcription:
+        if self.asr_handler is None and self.agent.config.audio_first_trans_mode == "none":
             warn(
                 "Audio-first transcription is disabled and no asr_handler was provided. "
                 "The agent will not receive input audio transcription and will probably not function correctly.",
@@ -124,16 +124,19 @@ class AgentHandler(StreamHandler):
             config.agent_voice_enrollment = self.latest_args[2]
             config.agent_voice_enrollment_text = self.latest_args[3]
             config.chunk_size_secs = float(self.latest_args[4])
-            config.text_first_temperature = float(self.latest_args[5])
-            config.text_first_top_p = float(self.latest_args[6])
-            config.text_first_min_p = float(self.latest_args[7])
-            config.text_first_presence_penalty = float(self.latest_args[8])
-            config.text_first_frequency_penalty = float(self.latest_args[9])
-            config.audio_first_cont_temperature = float(self.latest_args[10])
-            config.audio_first_trans_temperature = float(self.latest_args[11])
-            config.max_seq_length = int(self.latest_args[12])
-            config.trim_by = int(self.latest_args[13])
-            config.target_volume_rms = float(self.latest_args[14])
+            config.text_first_audio_temperature = float(self.latest_args[5])
+            config.text_first_audio_top_p = float(self.latest_args[6])
+            config.text_first_audio_min_p = float(self.latest_args[7])
+            config.text_first_audio_presence_penalty = float(self.latest_args[8])
+            config.text_first_audio_frequency_penalty = float(self.latest_args[9])
+            config.text_first_text_temperature = float(self.latest_args[10])
+            config.audio_first_trans_mode = self.latest_args[11]
+            config.audio_first_cont_temperature = float(self.latest_args[12])
+            config.audio_first_trans_temperature = float(self.latest_args[13])
+            config.max_seq_length = int(self.latest_args[14])
+            config.trim_by = int(self.latest_args[15])
+            config.target_volume_rms = float(self.latest_args[16])
+            config.non_activity_limit_secs = float(self.latest_args[17])
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -152,11 +155,11 @@ def main(args):
             mock = args.mock,
         ),
         config=RealtimeAgentConfig(
-            enable_audio_first_transcription = not args.whisper,
+            audio_first_trans_mode = "none" if args.whisper else "force_after_activity",
         ),
     )
     asr_handler = None
-    if not agent.config.enable_audio_first_transcription:
+    if agent.config.audio_first_trans_mode == "none":
         asr_handler = ASRHandlerMultiprocessing(
             config = ASRConfig(
                 model_size="small.en",
@@ -166,6 +169,9 @@ def main(args):
             ),
             device="cuda:2"
         )
+        allowed_trans_modes = ["none"]
+    else:
+        allowed_trans_modes = [m for m in AUDIO_FIRST_TRANSCRIPTION_MODES if m != "none"]
         
     handler = AgentHandler(agent, asr_handler)
     stream = Stream(
@@ -185,16 +191,19 @@ def main(args):
             gr.Audio(label="Agent Voice Enrollment"),
             gr.Textbox(label="Agent Voice Enrollment Text"),
             gr.Slider(0.02, 1.0, value=0.1, step=0.02, label="Chunk Size (seconds)"),
-            gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Text-First Temperature"),
-            gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Text-First Top-p"),
-            gr.Slider(0.0, 1.0, value=0.002, step=0.001, label="Text-First Min-p"),
-            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Presence Penalty"),
-            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Frequency Penalty"),
+            gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Text-First Audio Temperature"),
+            gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Text-First Audio Top-p"),
+            gr.Slider(0.0, 1.0, value=0.002, step=0.001, label="Text-First Audio Min-p"),
+            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Audio Presence Penalty"),
+            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Audio Frequency Penalty"),
+            gr.Slider(0.0, 2.0, value=0.8, step=0.05, label="Text-First Text Temperature"),
+            gr.Dropdown(allowed_trans_modes, value=agent.config.audio_first_trans_mode, label="Audio-First Transcription Mode"),
             gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="Audio-First Continuation Temperature"),
             gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Audio-First Transcription Temperature"),
             gr.Number(4096, minimum=512, maximum=8192, precision=0, label="Max Sequence Length (tokens)"),
             gr.Number(1024, minimum=128, maximum=2048, precision=0, label="Trim By (tokens)"),
             gr.Slider(0.0, 0.1, value=0.03, step=0.01, label="Volume Normalization (0 to disable)"),
+            gr.Slider(0.0, 10.0, value=3.0, step=0.1, label="Non-activity limit (seconds, 0 to disable)"),
         ],
         additional_outputs=[
             gr.Textbox(label="Realtime Factor"),

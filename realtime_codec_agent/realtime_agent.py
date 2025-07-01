@@ -38,6 +38,12 @@ class RealtimeAgentResources:
     def create_agent(self, config=None):
         return RealtimeAgent(resources=self, config=config)
 
+AUDIO_FIRST_TRANSCRIPTION_MODES = [
+    "force_after_activity",  # always attempt to after last chunk with audio activity
+    "predict", # predict if transcription should be done after every audio token (expensive)
+    "none", # never attempt to transcribe audio - transcriptions are provided externally
+]
+
 @dataclass
 class RealtimeAgentConfig:
     agent_opening_text: str = None
@@ -45,11 +51,13 @@ class RealtimeAgentConfig:
     agent_voice_enrollment_text: str = None
     agent_identity: str = "A"
     user_identity: str = "B"
-    text_first_temperature: float = 1.0
-    text_first_top_p: float = 1.0
-    text_first_min_p: float = 0.002
-    text_first_presence_penalty: float = 0.0
-    text_first_frequency_penalty: float = 0.0
+    text_first_audio_temperature: float = 1.0
+    text_first_audio_top_p: float = 1.0
+    text_first_audio_min_p: float = 0.002
+    text_first_audio_presence_penalty: float = 0.0
+    text_first_audio_frequency_penalty: float = 0.0
+    text_first_text_temperature: float = 0.8
+    audio_first_trans_mode: str = "force_after_activity"
     audio_first_cont_temperature: float = 0.6 
     audio_first_trans_temperature: float = 0.2
     chunk_size_secs: float = 0.1
@@ -57,6 +65,7 @@ class RealtimeAgentConfig:
     max_seq_length: int = 4096
     trim_by: int = 1024
     target_volume_rms: float = 0.03
+    non_activity_limit_secs = 3.0
     seed: Optional[int] = None
     audio_first_token: str = "<|audio_first|>"
     text_first_token: str = "<|text_first|>"
@@ -64,7 +73,6 @@ class RealtimeAgentConfig:
     end_header_token: str = "<|end_header|>"
     start_audio_token: str = "<|audio|>"
     end_audio_token: str = "<|end_audio|>"
-    enable_audio_first_transcription: bool = True
 
     def __post_init__(self):
         if int(self.chunk_size_secs*100) % 2 != 0:
@@ -73,6 +81,8 @@ class RealtimeAgentConfig:
             raise ValueError("Chunk fade length cannot be longer than the chunk size.")
         if self.agent_voice_enrollment is not None and not self.agent_voice_enrollment_text:
             raise ValueError("If agent_voice_enrollment is provided, agent_voice_enrollment_text must also be provided.")
+        if self.audio_first_trans_mode not in AUDIO_FIRST_TRANSCRIPTION_MODES:
+            raise ValueError(f"audio_first_trans_mode must be one of {AUDIO_FIRST_TRANSCRIPTION_MODES}.")
 
 @dataclass
 class GenerateParams:
@@ -131,6 +141,7 @@ class RealtimeAgent:
 
         self.generated_tokens = 0
         self.generated_audio_tokens = 0
+        self.non_activity_elapsed_secs = 0.0
         self.audio_history_ch1, self.audio_history_ch2 = np.zeros((2, 0), dtype=np.float32)
 
     def set_config(self, config: RealtimeAgentConfig):
@@ -181,12 +192,16 @@ class RealtimeAgent:
             return next_token_ids[0]
         return next_token_ids
 
-    def generate_for_mode(self, mode: str) -> Tuple[Optional[torch.LongTensor], Optional[torch.LongTensor], int]:
+    def generate_for_mode(self, mode: str, force_trans: bool, force_response: bool) -> Tuple[Optional[torch.LongTensor], Optional[torch.LongTensor], int]:
         # TODO: clean up this awful mess
         max_tokens = 100 if "text" in mode else 1
         if mode == "audio" or mode == "force_audio":
             logit_bias = {self.end_audio_token_id: -100} if mode == "force_audio" else None
-            if self.config.enable_audio_first_transcription:
+            if force_trans or force_response:
+                audio_first_next_tokens = torch.LongTensor([[self.end_audio_token_id if force_trans else self.start_audio_token_id]])
+                text_first_next_tokens = torch.LongTensor([[self.end_audio_token_id if force_response else self.start_audio_token_id]])
+                generated_tokens = 0
+            elif self.config.audio_first_trans_mode == "predict":
                 audio_first_next_tokens, text_first_next_tokens = self.generate(
                     [
                         GenerateParams(
@@ -200,11 +215,11 @@ class RealtimeAgent:
                             self.text_first_input_ids, 
                             SamplingParams(
                                 max_tokens=max_tokens, 
-                                temperature=self.config.text_first_temperature, 
-                                top_p=self.config.text_first_top_p,
-                                min_p=self.config.text_first_min_p,
-                                presence_penalty=self.config.text_first_presence_penalty, 
-                                frequency_penalty=self.config.text_first_frequency_penalty, 
+                                temperature=self.config.text_first_audio_temperature, 
+                                top_p=self.config.text_first_audio_top_p,
+                                min_p=self.config.text_first_audio_min_p,
+                                presence_penalty=self.config.text_first_audio_presence_penalty, 
+                                frequency_penalty=self.config.text_first_audio_frequency_penalty, 
                                 logit_bias=logit_bias,
                             ),
                         ),
@@ -219,11 +234,11 @@ class RealtimeAgent:
                             self.text_first_input_ids, 
                             SamplingParams(
                                 max_tokens=max_tokens, 
-                                temperature=self.config.text_first_temperature, 
-                                top_p=self.config.text_first_top_p,
-                                min_p=self.config.text_first_min_p,
-                                presence_penalty=self.config.text_first_presence_penalty, 
-                                frequency_penalty=self.config.text_first_frequency_penalty, 
+                                temperature=self.config.text_first_audio_temperature, 
+                                top_p=self.config.text_first_audio_top_p,
+                                min_p=self.config.text_first_audio_min_p,
+                                presence_penalty=self.config.text_first_audio_presence_penalty, 
+                                frequency_penalty=self.config.text_first_audio_frequency_penalty, 
                                 logit_bias=logit_bias,
                             ),
                         ),
@@ -245,11 +260,7 @@ class RealtimeAgent:
                         self.text_first_input_ids, 
                         SamplingParams(
                             max_tokens=max_tokens, 
-                            temperature=self.config.text_first_temperature, 
-                            top_p=self.config.text_first_top_p,
-                            min_p=self.config.text_first_min_p,
-                            presence_penalty=self.config.text_first_presence_penalty, 
-                            frequency_penalty=self.config.text_first_frequency_penalty, 
+                            temperature=self.config.text_first_text_temperature, 
                             stop_token_ids=[self.start_audio_token_id], 
                             stop=f" {self.config.user_identity}:",
                         ),
@@ -276,11 +287,7 @@ class RealtimeAgent:
                     self.text_first_input_ids, 
                     SamplingParams(
                         max_tokens=max_tokens, 
-                        temperature=self.config.text_first_temperature, 
-                        top_p=self.config.text_first_top_p,
-                        min_p=self.config.text_first_min_p,
-                        presence_penalty=self.config.text_first_presence_penalty, 
-                        frequency_penalty=self.config.text_first_frequency_penalty, 
+                        temperature=self.config.text_first_text_temperature, 
                         stop_token_ids=[self.start_audio_token_id], 
                         stop=f" {self.config.user_identity}:",
                     ),
@@ -299,7 +306,7 @@ class RealtimeAgent:
 
         return audio_first_next_tokens, text_first_next_tokens, generated_tokens
 
-    def process_audio_input_ids(self, audio_chunk_input_ids: torch.LongTensor) -> torch.LongTensor:
+    def process_audio_input_ids(self, audio_chunk_input_ids: torch.LongTensor, force_trans: bool, force_response: bool) -> torch.LongTensor:
         out_chunk_input_ids = torch.zeros((1, 0), dtype=audio_chunk_input_ids.dtype)
         for i in range(audio_chunk_input_ids.shape[-1]):
             mode = "audio"
@@ -307,7 +314,8 @@ class RealtimeAgent:
                 # trim the sequences to the maximum length
                 self.trim_sequences()
                 # predict next tokens
-                audio_first_next_tokens, text_first_next_tokens, generated_tokens = self.generate_for_mode(mode)
+                audio_first_next_tokens, text_first_next_tokens, generated_tokens = self.generate_for_mode(mode, force_trans, force_response)
+                force_trans = force_response = False
                 self.generated_tokens += generated_tokens
                 if mode == "audio" or mode == "force_audio":
                     if audio_first_next_tokens[0, 0] == self.end_audio_token_id and text_first_next_tokens[0, 0] == self.end_audio_token_id:
@@ -395,6 +403,34 @@ class RealtimeAgent:
             dim=1,
         )
 
+    def should_force_text(self, audio_chunk: np.ndarray):
+        last_in_chunk = self.audio_history_ch2[-self.chunk_size_samples:]
+        last_out_chunk = self.audio_history_ch1[-2*self.chunk_size_samples:-self.chunk_size_samples]
+        curr_in_chunk = audio_chunk
+        curr_out_chunk = self.audio_history_ch1[-self.chunk_size_samples:]
+
+        last_in_chunk_abs_max = 0.0 if last_in_chunk.size == 0 else np.abs(last_in_chunk).max()
+        last_out_chunk_abs_max = 0.0 if last_out_chunk.size == 0 else np.abs(last_out_chunk).max()
+        curr_in_chunk_abs_max = np.abs(curr_in_chunk).max()
+        curr_out_chunk_abs_max = 0.0 if curr_out_chunk.size == 0 else np.abs(curr_out_chunk).max()
+
+        activity_abs_max_threshold = 100 / 32768.0
+        force_trans = force_response = False
+        # Should force transcription?
+        if self.config.audio_first_trans_mode == "force_after_activity":
+            force_trans = (
+                (last_in_chunk_abs_max >= activity_abs_max_threshold and curr_in_chunk_abs_max < activity_abs_max_threshold) or
+                (last_out_chunk_abs_max >= activity_abs_max_threshold and curr_out_chunk_abs_max < activity_abs_max_threshold)
+            )
+        # Should force response?
+        if curr_in_chunk_abs_max >= activity_abs_max_threshold or curr_out_chunk_abs_max >= activity_abs_max_threshold:
+            self.non_activity_elapsed_secs = 0.0
+        else:
+            self.non_activity_elapsed_secs += self.config.chunk_size_secs
+        if self.config.non_activity_limit_secs > 0:
+            force_response = self.non_activity_elapsed_secs >= self.config.non_activity_limit_secs
+        return force_trans, force_response
+
     def process_audio(self, audio_chunk: np.ndarray, trans_chunk: Optional[str] = None) -> np.ndarray:
         # Sanity check - input size
         if audio_chunk.shape[-1] != self.chunk_size_samples:
@@ -411,7 +447,8 @@ class RealtimeAgent:
             # Mock mode, just return the audio chunk as is
             out_chunk_input_ids = audio_chunk_input_ids
         else:
-            out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids)
+            force_trans, force_response = self.should_force_text(audio_chunk)
+            out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans, force_response)
 
         # Decode input ids to audio chunk and append to the audio history
         out_chunk_str = self.resources.tokenizer.decode(out_chunk_input_ids[0], skip_special_tokens=False)

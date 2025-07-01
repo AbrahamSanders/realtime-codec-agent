@@ -57,23 +57,20 @@ def generate(llm: LLM, generate_params: Union[List[GenerateParams], GeneratePara
         return next_token_ids[0]
     return next_token_ids
 
-def generate_for_mode(llm, audio_first_input_ids, text_first_input_ids, mode, start_audio_token_id, end_audio_token_id):
+def generate_for_mode(llm, audio_first_input_ids, text_first_input_ids, mode, start_audio_token_id, end_audio_token_id, force_trans):
     if mode == "audio" or mode == "force_audio":
         logit_bias = {end_audio_token_id: -100} if mode == "force_audio" else None
-        audio_first_next_tokens, text_first_next_tokens = generate(
+        audio_first_next_tokens = torch.LongTensor([[end_audio_token_id if force_trans else start_audio_token_id]])
+        text_first_next_tokens = generate(
             llm, 
             [
                 GenerateParams(
-                    audio_first_input_ids, 
-                    SamplingParams(max_tokens=1, temperature=0.6),
-                ),
-                GenerateParams(
                     text_first_input_ids, 
-                    SamplingParams(max_tokens=1, temperature=0.8, presence_penalty=0.5, frequency_penalty=0.5, logit_bias=logit_bias),
+                    SamplingParams(max_tokens=1, temperature=1.0, min_p=0.002, logit_bias=logit_bias),
                 ),
             ]
         )
-        generated_tokens = 2
+        generated_tokens = 1
     elif mode == "both_text":
         audio_first_next_tokens, text_first_next_tokens = generate(
             llm, 
@@ -84,7 +81,7 @@ def generate_for_mode(llm, audio_first_input_ids, text_first_input_ids, mode, st
                 ),
                 GenerateParams(
                     text_first_input_ids, 
-                    SamplingParams(max_tokens=100, temperature=0.8, presence_penalty=0.5, frequency_penalty=0.5, stop_token_ids=[start_audio_token_id], stop=" B:"),
+                    SamplingParams(max_tokens=100, temperature=1.0, min_p=0.002, stop_token_ids=[start_audio_token_id], stop=" B:"),
                 ),
             ]
         )
@@ -104,7 +101,7 @@ def generate_for_mode(llm, audio_first_input_ids, text_first_input_ids, mode, st
             llm,
             GenerateParams(
                 text_first_input_ids, 
-                SamplingParams(max_tokens=100, temperature=0.8, presence_penalty=0.5, frequency_penalty=0.5, stop_token_ids=[start_audio_token_id], stop=" B:"),
+                SamplingParams(max_tokens=100, temperature=1.0, min_p=0.002, stop_token_ids=[start_audio_token_id], stop=" B:"),
             ),
         )
         generated_tokens = text_first_next_tokens.shape[-1]
@@ -166,9 +163,21 @@ if __name__ == "__main__":
     end_audio_token_id = tokenizer.convert_tokens_to_ids("<|end_audio|>")
     user_speaker_token_id = tokenizer.encode(" B", add_special_tokens=False)[0]
     start_time = time.time()
+    last_in_chunk_abs_max = 0.0
+    last_out_chunk_abs_max = 0.0
+    out_chunk = None
+    trans_abs_max_threshold = 100 / 32768.0
     for start in trange(0, len(audio), chunk_size_samples, desc="Chunks"):
         end = start + chunk_size_samples
         audio_chunk = audio[start:end]
+        in_chunk_abs_max = np.abs(audio_chunk).max()
+        out_chunk_abs_max = 0.0 if out_chunk is None else np.abs(out_chunk).max()
+        force_trans = (
+            (last_in_chunk_abs_max >= trans_abs_max_threshold and in_chunk_abs_max < trans_abs_max_threshold) or
+            (last_out_chunk_abs_max >= trans_abs_max_threshold and out_chunk_abs_max < trans_abs_max_threshold)
+        )
+        last_in_chunk_abs_max = in_chunk_abs_max
+        last_out_chunk_abs_max = out_chunk_abs_max
         audio_chunk_str = audio_tokenizer.tokenize_audio(audio_chunk)
         audio_chunk_input_ids = tokenizer(audio_chunk_str, add_special_tokens=False, return_tensors="pt").input_ids
         out_chunk_input_ids = torch.zeros((1, 0), dtype=audio_chunk_input_ids.dtype)
@@ -182,8 +191,9 @@ if __name__ == "__main__":
                 )
                 # predict next tokens
                 audio_first_next_tokens, text_first_next_tokens, generated_tokens_ = generate_for_mode(
-                    llm, audio_first_input_ids, text_first_input_ids, mode, start_audio_token_id, end_audio_token_id
+                    llm, audio_first_input_ids, text_first_input_ids, mode, start_audio_token_id, end_audio_token_id, force_trans
                 )
+                force_trans = False
                 generated_tokens += generated_tokens_
                 if mode == "audio" or mode == "force_audio":
                     if audio_first_next_tokens[0, 0] == end_audio_token_id and text_first_next_tokens[0, 0] == end_audio_token_id:
