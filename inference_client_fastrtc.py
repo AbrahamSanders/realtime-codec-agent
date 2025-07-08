@@ -3,6 +3,7 @@ from fastrtc import StreamHandler, Stream, AdditionalOutputs
 from queue import Queue, Empty
 from warnings import warn
 from datetime import datetime
+from dotenv import load_dotenv
 import gradio as gr
 import numpy as np
 import soundfile as sf
@@ -93,8 +94,14 @@ class AgentHandler(StreamHandler):
         if not self.started:
             print(">>> Not Started <<<")
             return
+        transcript = self.agent.format_transcript()
         audio_first_sequence, text_first_sequence = self.agent.get_sequence_strs()
         with open("output.txt", "w", encoding="utf-8") as f:
+            f.write("---------------------------------------------------------------------------------------\n")
+            f.write("-- Transcript:\n")
+            f.write("---------------------------------------------------------------------------------------\n")
+            f.write(transcript)
+            f.write("\n\n")
             f.write("---------------------------------------------------------------------------------------\n")
             f.write("-- Audio First Sequence:\n")
             f.write("---------------------------------------------------------------------------------------\n")
@@ -137,6 +144,8 @@ class AgentHandler(StreamHandler):
             config.trim_by = int(self.latest_args[15])
             config.target_volume_rms = float(self.latest_args[16])
             config.non_activity_limit_secs = float(self.latest_args[17])
+            config.use_external_llm = bool(self.latest_args[18])
+            config.external_llm_instructions = self.latest_args[19]
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -204,6 +213,8 @@ def main(args):
             gr.Number(1024, minimum=128, maximum=2048, precision=0, label="Trim By (tokens)"),
             gr.Slider(0.0, 0.1, value=0.03, step=0.01, label="Volume Normalization (0 to disable)"),
             gr.Slider(0.0, 10.0, value=3.0, step=0.1, label="Non-activity limit (seconds, 0 to disable)"),
+            gr.Checkbox(True, label=f"Use External LLM ({agent.config.external_llm_model})"),
+            gr.TextArea(label="External LLM Instructions"),
         ],
         additional_outputs=[
             gr.Textbox(label="Realtime Factor"),
@@ -219,4 +230,8 @@ if __name__ == "__main__":
     parser.add_argument("--mock", action="store_true", help="Enable mock mode (does not start vLLM, echos input audio).")
     parser.add_argument("--whisper", action="store_true", help="Use Whisper for ASR instead of native audio-first transcription.")
     args = parser.parse_args()
+
+    # Load environment variables from .env file
+    load_dotenv(override=True)
+
     main(args)

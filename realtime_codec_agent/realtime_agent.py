@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import time
 import itertools
+from datetime import datetime, timedelta
 from typing import Tuple, Union, List, Optional
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams, TokensPrompt
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 
 from .audio_tokenizer import AudioTokenizer
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
+from .external_llm import get_external_llm_messages
 
 
 class RealtimeAgentResources:
@@ -73,6 +75,12 @@ class RealtimeAgentConfig:
     end_header_token: str = "<|end_header|>"
     start_audio_token: str = "<|audio|>"
     end_audio_token: str = "<|end_audio|>"
+    use_external_llm: bool = True
+    external_llm_api_key: str = None
+    external_llm_base_url: str = None
+    external_llm_model: str = "gpt-4o-mini"
+    external_llm_top_p: float = 0.9
+    external_llm_instructions: str = None
 
     def __post_init__(self):
         if int(self.chunk_size_secs*100) % 2 != 0:
@@ -143,6 +151,14 @@ class RealtimeAgent:
         self.generated_audio_tokens = 0
         self.non_activity_elapsed_secs = 0.0
         self.audio_history_ch1, self.audio_history_ch2 = np.zeros((2, 0), dtype=np.float32)
+        self.transcript = []
+        if c.agent_opening_text:
+            self.transcript.append({
+                "speaker": c.agent_identity,
+                "text": c.agent_opening_text,
+                "time_secs": 0.0,
+            })
+        self.start_time = datetime.now()
 
     def set_config(self, config: RealtimeAgentConfig):
         self.config = config
@@ -156,6 +172,13 @@ class RealtimeAgent:
         self.start_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.start_audio_token)
         self.end_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_audio_token)
         self.user_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.user_identity}", add_special_tokens=False)[0]
+
+        if self.config.use_external_llm:
+            from openai import OpenAI
+            self.client = OpenAI(
+                api_key=self.config.external_llm_api_key, 
+                base_url=self.config.external_llm_base_url,
+            )
 
     def trim_sequences(self) -> None:
         if self.audio_first_input_ids.shape[-1] >= self.config.max_seq_length:
@@ -175,6 +198,29 @@ class RealtimeAgent:
                 dim=1,
             )
             self.text_first_trans_pos = max(self.text_first_trim_pos, self.text_first_trans_pos-self.config.trim_by)
+
+    def call_external_llm(self, text_first_next_tokens: torch.LongTensor) -> torch.LongTensor:
+        if text_first_next_tokens.shape[-1] <= 6:
+            return text_first_next_tokens
+
+        messages = get_external_llm_messages(
+            self.client.base_url.host, 
+            self.config.external_llm_instructions, 
+            self.transcript, 
+            self.config.agent_identity,
+        )
+        response = self.client.chat.completions.create(
+            model=self.config.external_llm_model,
+            messages=messages,
+            max_tokens=100,
+            top_p=self.config.external_llm_top_p,
+        )
+        response_text = response.choices[0].message.content.replace("\n", " ").strip().lower()
+        if response_text == "[silence]":
+            return torch.LongTensor([[]])
+        response_text = f" {self.config.agent_identity}: {response_text}{self.config.start_audio_token}"
+        response_tokens = self.resources.tokenizer(response_text, add_special_tokens=False, return_tensors="pt").input_ids
+        return response_tokens
 
     def generate(self, generate_params: Union[List[GenerateParams], GenerateParams]) -> Union[List[torch.LongTensor], torch.LongTensor]:
         if isinstance(generate_params, GenerateParams):
@@ -352,6 +398,7 @@ class RealtimeAgent:
                                 ], 
                                 dim=1,
                             )
+                            self.append_transcript(audio_first_next_tokens)
                         self.text_first_trans_pos = self.text_first_input_ids.shape[-1]-1 \
                             if self.text_first_input_ids[0, -1] == self.start_audio_token_id else self.text_first_input_ids.shape[-1]
                 if mode == "text_first_text" or mode == "both_text":
@@ -361,10 +408,33 @@ class RealtimeAgent:
                         self.text_first_input_ids = self.text_first_input_ids[..., :-1]
                         mode = "force_audio"
                     else:
-                        self.text_first_input_ids = torch.cat([self.text_first_input_ids, text_first_next_tokens], dim=1)
                         if text_first_next_tokens[0, 0] != self.end_audio_token_id:
-                            mode = "audio"
+                            if self.config.use_external_llm:
+                                text_first_next_tokens = self.call_external_llm(text_first_next_tokens)
+                            if text_first_next_tokens.shape[-1] == 0:
+                                self.text_first_input_ids = self.text_first_input_ids[..., :-1]
+                                mode = "force_audio"
+                            else:
+                                self.append_transcript(text_first_next_tokens)
+                                mode = "audio"
+                        self.text_first_input_ids = torch.cat([self.text_first_input_ids, text_first_next_tokens], dim=1)
         return out_chunk_input_ids
+
+    def append_transcript(self, text_input_ids: torch.LongTensor):
+        if text_input_ids is None or text_input_ids.shape[-1] == 0:
+            return
+        text_str = self.resources.tokenizer.decode(text_input_ids[0], skip_special_tokens=False)
+        text_str = text_str.replace(self.config.start_audio_token, "").strip()
+        speaker = ""
+        time_secs = (datetime.now() - self.start_time).total_seconds()
+        if len(text_str) > 1 and text_str[1] == ":":
+            speaker = text_str[0]
+            text_str = text_str[2:].lstrip()
+        self.transcript.append({
+            "speaker": speaker,
+            "text": text_str,
+            "time_secs": time_secs,
+        })
 
     def inject_transcription_chunk(self, trans_chunk: str):
         if not trans_chunk or not trans_chunk.startswith("*"):
@@ -402,6 +472,7 @@ class RealtimeAgent:
             ], 
             dim=1,
         )
+        self.append_transcript(trans_chunk_input_ids)
 
     def should_force_text(self, audio_chunk: np.ndarray):
         last_in_chunk = self.audio_history_ch2[-self.chunk_size_samples:]
@@ -479,6 +550,12 @@ class RealtimeAgent:
     def get_audio_history(self) -> np.ndarray:
         audio_history = np.stack([self.audio_history_ch1, self.audio_history_ch2], axis=0)
         return audio_history
+    
+    def format_transcript(self) -> str:
+        formatted_transcript = "\n".join([
+            f"[{timedelta(seconds=int(entry['time_secs']))}] {entry['speaker']}: {entry['text']}" for entry in self.transcript
+        ])
+        return formatted_transcript
 
 class RealtimeAgentMultiprocessing:
     def __init__(
