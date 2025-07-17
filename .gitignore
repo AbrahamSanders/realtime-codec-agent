@@ -183,3 +183,6 @@ output*.txt
 
 sph2pipe
 *.out
+
+model.cache
+config-stt-en_fr-hf.toml

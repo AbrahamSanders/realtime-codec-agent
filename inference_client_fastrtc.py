@@ -1,26 +1,29 @@
-from typing import Optional
 from fastrtc import StreamHandler, Stream, AdditionalOutputs
 from queue import Queue, Empty
-from warnings import warn
 from datetime import datetime
 from dotenv import load_dotenv
+from websockets.sync.client import connect
+from collections import deque
 import gradio as gr
 import numpy as np
 import soundfile as sf
 import argparse
+import msgpack
+import librosa
 
-from realtime_codec_agent.realtime_agent import RealtimeAgent, RealtimeAgentResources, RealtimeAgentConfig, AUDIO_FIRST_TRANSCRIPTION_MODES
-from realtime_codec_agent.asr_handler import ASRHandlerMultiprocessing, ASRConfig
+from realtime_codec_agent.realtime_agent import RealtimeAgent, RealtimeAgentResources, AUDIO_FIRST_TRANSCRIPTION_MODES
 
 class AgentHandler(StreamHandler):
-    def __init__(self, agent: RealtimeAgent, asr_handler: Optional[ASRHandlerMultiprocessing] = None, report_interval_secs: float = 1.0):
+    def __init__(self, agent: RealtimeAgent, kyutai_stt_ws_url: str, kyutai_stt_api_key: str, report_interval_secs: float = 1.0):
         super().__init__(
             input_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
             output_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
         )
         self.agent = agent
-        self.asr_handler = asr_handler
+        self.kyutai_stt_ws_url = kyutai_stt_ws_url
+        self.kyutai_stt_api_key = kyutai_stt_api_key
         self.report_interval_secs = report_interval_secs
+
         self.in_buffer = np.zeros((1, 0), dtype=np.int16)
         self.queue = Queue()
         self.started = False
@@ -28,11 +31,13 @@ class AgentHandler(StreamHandler):
         self.report_chunk_count = 0
         self.last_report_time = datetime.now()
 
-        if self.asr_handler is None and self.agent.config.audio_first_trans_mode == "none":
-            warn(
-                "Audio-first transcription is disabled and no asr_handler was provided. "
-                "The agent will not receive input audio transcription and will probably not function correctly.",
-            )
+        self.stt_websocket = None
+        self.stt_in_buffer = np.zeros((1, 0), dtype=np.int16)
+        self.stt_chunk_size_samples = int(self.input_sample_rate * 0.08)
+        self.stt_sample_rate = 24000
+        self.stt_chunk = ""
+        self.stt_chunk_start = None
+        self.stt_ready_chunks = deque()
 
     def receive(self, frame: tuple[int, np.ndarray]) -> None:
         if not self.started:
@@ -41,11 +46,51 @@ class AgentHandler(StreamHandler):
         self.in_buffer = np.concatenate((self.in_buffer, frame_audio), axis=1)
         if self.in_buffer.shape[-1] >= self.agent.chunk_size_samples:
             chunk, self.in_buffer = np.split(self.in_buffer, [self.agent.chunk_size_samples], axis=1)
-            if self.asr_handler is not None:
-                self.asr_handler.queue_input((self.input_sample_rate, chunk.squeeze(0)))
             self.queue.put(chunk)
+        self.queue_frame_for_stt(frame_audio)
+
+    def queue_frame_for_stt(self, frame_audio: np.ndarray) -> None:
+        if self.stt_websocket is None:
+            return
+        self.stt_in_buffer = np.concatenate((self.stt_in_buffer, frame_audio), axis=1)
+        while self.stt_in_buffer.shape[-1] >= self.stt_chunk_size_samples:
+            chunk, self.stt_in_buffer = np.split(self.stt_in_buffer, [self.stt_chunk_size_samples], axis=1)
+            chunk = chunk.squeeze(0).astype(np.float32) / 32768.0
+            chunk = librosa.resample(chunk, orig_sr=self.input_sample_rate, target_sr=self.stt_sample_rate)
+            chunk = {"type": "Audio", "pcm": chunk.tolist()}
+            msg = msgpack.packb(chunk, use_bin_type=True, use_single_float=True)
+            self.stt_websocket.send(msg)
+
+    def read_stt_result(self) -> None:
+        if self.stt_websocket is None:
+            return
+        messages = []
+        while True:
+            try:
+                messages.append(self.stt_websocket.recv(timeout=0))
+            except TimeoutError:
+                break
+        
+        for message in messages:
+            data = msgpack.unpackb(message, raw=False)
+            
+            text = ""
+            pause = False
+            #pause = data["type"] == "Step" and data["prs"][2] > 0.99 and self.stt_chunk_start is not None
+            if data["type"] == "Word":
+                text = data["text"]
+                self.stt_chunk += f" {text}"
+                if self.stt_chunk_start is None:
+                    self.stt_chunk_start = data["start_time"]
+
+            if pause or text.endswith(".") or text.endswith("!") or text.endswith("?") or text.endswith(","):
+                self.stt_ready_chunks.append((self.stt_chunk.lstrip(), self.stt_chunk_start))
+                self.stt_chunk = ""
+                self.stt_chunk_start = None
 
     def emit(self) -> None:
+        # Get the next transcription chunk from the websocket if available
+        self.read_stt_result()
         try:
             chunk = self.queue.get_nowait()
         except Empty:
@@ -58,15 +103,11 @@ class AgentHandler(StreamHandler):
             chunk = np.zeros_like(chunk)
 
         print(f'Data from microphone:{chunk.shape, chunk.dtype, chunk.min(), chunk.max()}')
-        
-        # Get the next transcription chunk from the ASR handler
-        trans_chunk = None
-        if self.asr_handler is not None:
-            trans_chunk = self.asr_handler.next_output()
 
         # Process the chunk and get the next output
         chunk = chunk.squeeze(0).astype(np.float32) / 32768.0
-        out_chunk = self.agent.process_audio(chunk, trans_chunk)
+        next_stt_chunk = self.stt_ready_chunks.popleft() if self.stt_ready_chunks else None
+        out_chunk = self.agent.process_audio(chunk, next_stt_chunk)
         out_chunk = np.expand_dims((out_chunk * 32767.0).astype(np.int16), axis=0)
         
         print(f'Data from model:{out_chunk.shape, out_chunk.dtype, out_chunk.min(), out_chunk.max()}')
@@ -88,7 +129,7 @@ class AgentHandler(StreamHandler):
         return (self.output_sample_rate, out_chunk)
 
     def copy(self):
-        return AgentHandler(self.agent, self.asr_handler)
+        return AgentHandler(self.agent, self.kyutai_stt_ws_url, self.kyutai_stt_api_key, self.report_interval_secs)
 
     def shutdown(self):
         if not self.started:
@@ -115,11 +156,18 @@ class AgentHandler(StreamHandler):
         audio_history = self.agent.get_audio_history()
         audio_history = (audio_history * 32767.0).astype(np.int16)
         sf.write("output.wav", audio_history.T, self.output_sample_rate)
+
+        if self.stt_websocket is not None:
+            self.stt_websocket.close()
+            self.stt_websocket = None
+        
         self.started = False
         print(">>> Stopped <<<")
 
     def start_up(self) -> None:
         self.set_config_and_reset()
+        if self.agent.config.audio_first_trans_mode == "none":
+            self.stt_websocket = connect(self.kyutai_stt_ws_url, additional_headers={"kyutai-api-key": self.kyutai_stt_api_key})
         self.started = True
         print(">>> Started <<<")
 
@@ -140,8 +188,8 @@ class AgentHandler(StreamHandler):
             config.audio_first_trans_mode = self.latest_args[11]
             config.audio_first_cont_temperature = float(self.latest_args[12])
             config.audio_first_trans_temperature = float(self.latest_args[13])
-            config.max_seq_length = int(self.latest_args[14])
-            config.trim_by = int(self.latest_args[15])
+            config.max_context_secs = float(self.latest_args[14])
+            config.trim_by_secs = float(self.latest_args[15])
             config.target_volume_rms = float(self.latest_args[16])
             config.non_activity_limit_secs = float(self.latest_args[17])
             config.use_external_llm = bool(self.latest_args[18])
@@ -163,26 +211,8 @@ def main(args):
             debug = args.debug,
             mock = args.mock,
         ),
-        config=RealtimeAgentConfig(
-            audio_first_trans_mode = "none" if args.whisper else "force_after_activity",
-        ),
     )
-    asr_handler = None
-    if agent.config.audio_first_trans_mode == "none":
-        asr_handler = ASRHandlerMultiprocessing(
-            config = ASRConfig(
-                model_size="small.en",
-                n_context_segs=2,
-                n_prefix_segs=2,
-                max_buffer_size=10,
-            ),
-            device="cuda:2"
-        )
-        allowed_trans_modes = ["none"]
-    else:
-        allowed_trans_modes = [m for m in AUDIO_FIRST_TRANSCRIPTION_MODES if m != "none"]
-        
-    handler = AgentHandler(agent, asr_handler)
+    handler = AgentHandler(agent, args.kyutai_stt_ws_url, args.kyutai_stt_api_key)
     stream = Stream(
         handler=handler,
         track_constraints = {
@@ -196,7 +226,7 @@ def main(args):
         modality="audio", 
         mode="send-receive",
         additional_inputs=[
-            gr.Textbox("hello my name is alex, how can i help you?", label="Agent Opening Text"),
+            gr.Textbox("hello how are you?", label="Agent Opening Text"),
             gr.Audio(label="Agent Voice Enrollment"),
             gr.Textbox(label="Agent Voice Enrollment Text"),
             gr.Slider(0.02, 1.0, value=0.1, step=0.02, label="Chunk Size (seconds)"),
@@ -206,14 +236,14 @@ def main(args):
             gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Audio Presence Penalty"),
             gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Text-First Audio Frequency Penalty"),
             gr.Slider(0.0, 2.0, value=0.8, step=0.05, label="Text-First Text Temperature"),
-            gr.Dropdown(allowed_trans_modes, value=agent.config.audio_first_trans_mode, label="Audio-First Transcription Mode"),
+            gr.Dropdown(AUDIO_FIRST_TRANSCRIPTION_MODES, value=agent.config.audio_first_trans_mode, label="Audio-First Transcription Mode"),
             gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="Audio-First Continuation Temperature"),
             gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Audio-First Transcription Temperature"),
-            gr.Number(4096, minimum=512, maximum=8192, precision=0, label="Max Sequence Length (tokens)"),
-            gr.Number(1024, minimum=128, maximum=2048, precision=0, label="Trim By (tokens)"),
-            gr.Slider(0.0, 0.1, value=0.03, step=0.01, label="Volume Normalization (0 to disable)"),
+            gr.Number(40.0, minimum=5.0, maximum=80.0, step=5.0, label="Max Context Length (seconds)"),
+            gr.Number(10.0, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
+            gr.Slider(0.0, 0.1, value=0.05, step=0.01, label="Volume Normalization (0 to disable)"),
             gr.Slider(0.0, 10.0, value=3.0, step=0.1, label="Non-activity limit (seconds, 0 to disable)"),
-            gr.Checkbox(True, label=f"Use External LLM ({agent.config.external_llm_model})"),
+            gr.Checkbox(False, label=f"Use External LLM ({agent.config.external_llm_model})"),
             gr.TextArea(label="External LLM Instructions"),
         ],
         additional_outputs=[
@@ -228,7 +258,9 @@ if __name__ == "__main__":
     parser.add_argument("--tensor_parallel_size", type=int, default=2, help="Sets tensor_parallel_size for vLLM (number of GPUs).")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (starts vLLM in eager mode).")
     parser.add_argument("--mock", action="store_true", help="Enable mock mode (does not start vLLM, echos input audio).")
-    parser.add_argument("--whisper", action="store_true", help="Use Whisper for ASR instead of native audio-first transcription.")
+    parser.add_argument("--kyutai_stt_ws_url", help="Websocket URL for Kyutai STT Rust server", default="ws://127.0.0.1:8080/api/asr-streaming")
+    parser.add_argument("--kyutai_stt_api_key", help="API Key for Kyutai STT Rust server", default="public_token")
+
     args = parser.parse_args()
 
     # Load environment variables from .env file
