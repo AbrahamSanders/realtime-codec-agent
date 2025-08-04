@@ -67,7 +67,7 @@ class RealtimeAgentConfig:
     max_context_secs: float = 40.0
     trim_by_secs: float = 10.0
     target_volume_rms: float = 0.05
-    non_activity_limit_secs = 3.0
+    non_activity_limit_secs: float = 3.0
     seed: Optional[int] = None
     audio_first_token: str = "<|audio_first|>"
     text_first_token: str = "<|text_first|>"
