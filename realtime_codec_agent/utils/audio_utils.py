@@ -18,7 +18,7 @@ def smooth_join(chunk1: np.ndarray, chunk2: np.ndarray, L: int, fade_in: np.ndar
 
 def create_crossfade_ramps(sr: int, fade_secs: float) -> Tuple[int, np.ndarray, np.ndarray]:
     L = int(sr * fade_secs)
-    fade_in = np.sin(0.5 * np.pi * np.linspace(0, 1, L, endpoint=False))
+    fade_in = np.sin(0.5 * np.pi * np.linspace(0, 1, L, endpoint=False, dtype=np.float32))
     fade_out = fade_in[::-1]
     return L, fade_in, fade_out
 
