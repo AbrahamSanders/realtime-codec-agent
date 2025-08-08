@@ -48,8 +48,8 @@ class RealtimeAgentConfig:
     max_context_secs: float = 80.0
     trim_by_secs: float = 20.0
     seed: Optional[int] = None
-    header_agent_token: str = "<|agent|>",
-    header_agent_voice_token: str = "<|agent_voice|>",
+    header_agent_token: str = "<|agent|>"
+    header_agent_voice_token: str = "<|agent_voice|>"
     header_speaker_token: str = "<|speaker|>"
     end_header_token: str = "<|end_header|>"
     start_audio_token: str = "<|audio|>"
@@ -85,9 +85,9 @@ class RealtimeAgent:
         )
         self.resources.llm.reset()
         
-        if c.agent_voice_enrollment is None:
-            raise ValueError("Agent voice enrollment audio must be provided.")
-        enrollment_audio_str = self.resources.audio_tokenizer.chunked_tokenize_audio(c.agent_voice_enrollment, c.chunk_size_secs)
+        voice_enrollment = np.zeros(self.resources.audio_tokenizer.sampling_rate * 3, dtype=np.float32) \
+            if c.agent_voice_enrollment is None else c.agent_voice_enrollment
+        enrollment_audio_str = self.resources.audio_tokenizer.chunked_tokenize_audio(voice_enrollment, c.chunk_size_secs)
         
         agent_prompt = "".join([
             c.header_agent_token,
@@ -154,7 +154,9 @@ class RealtimeAgent:
             self.trim_sequences()
             while True:
                 # predict next token
-                next_token = next(self.resources.llm.generate(self.input_ids[0, -1:].tolist(), reset=False))
+                audio_mode = (self.input_ids[0, -2:] > self.end_header_token_id).all()
+                last_n = 2 if audio_mode else 1
+                next_token = next(self.resources.llm.generate(self.input_ids[0, -last_n:].tolist(), reset=False))
                 next_token = torch.LongTensor([[next_token]])
                 self.input_ids = torch.cat([self.input_ids, next_token], dim=1)
                 self.generated_tokens += 1
