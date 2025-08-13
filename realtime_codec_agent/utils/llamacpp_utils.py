@@ -24,7 +24,9 @@ class LlamaForAlternatingCodeChannels(Llama):
         penalize_nl: bool = True,
         logits_processor: Optional[LogitsProcessorList] = None,
         grammar: Optional[LlamaGrammar] = None,
+        seed: Optional[int] = None,
     ) -> None:
+        self.set_seed(seed if seed is not None else -1)
         # Reset mirostat sampling
         self._mirostat_mu = ctypes.c_float(2.0 * mirostat_tau)
         self._sampler = self._init_sampler(

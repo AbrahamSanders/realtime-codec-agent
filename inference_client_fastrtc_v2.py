@@ -1,6 +1,7 @@
 from fastrtc import StreamHandler, Stream, AdditionalOutputs
 from queue import Queue, Empty
 from datetime import datetime
+import logging
 import gradio as gr
 import numpy as np
 import soundfile as sf
@@ -113,10 +114,11 @@ class AgentHandler(StreamHandler):
             config.top_k = int(self.latest_args[5])
             config.top_p = float(self.latest_args[6])
             config.min_p = float(self.latest_args[7])
-            config.presence_penalty = float(self.latest_args[8])
-            config.frequency_penalty = float(self.latest_args[9])
-            config.max_context_secs = float(self.latest_args[10])
-            config.trim_by_secs = float(self.latest_args[11])
+            config.repeat_penalty = float(self.latest_args[8])
+            config.presence_penalty = float(self.latest_args[9])
+            config.frequency_penalty = float(self.latest_args[10])
+            config.max_context_secs = float(self.latest_args[11])
+            config.trim_by_secs = float(self.latest_args[12])
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -128,6 +130,9 @@ def display_handler(component1, realtime_factor: str):
     return realtime_factor
 
 def main(args):
+    print(f"Running with args: {args}")
+    logging.basicConfig(level=logging.INFO)
+
     agent = RealtimeAgent(
         resources=RealtimeAgentResources(
             llm_model_path=args.llm_model_path,
@@ -154,6 +159,7 @@ def main(args):
             gr.Slider(0, 500, value=100, step=1, label="Top-k"),
             gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Top-p"),
             gr.Slider(0.0, 1.0, value=0.0, step=0.001, label="Min-p"),
+            gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Repeat Penalty"),
             gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Presence Penalty"),
             gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Frequency Penalty"),
             gr.Number(80.0, minimum=5.0, maximum=80.0, step=5.0, label="Max Context Length (seconds)"),
@@ -170,7 +176,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Realtime Codec Agent with FastRTC.")
     parser.add_argument(
         "--llm_model_path", 
-        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-2-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-2-BF16.gguf", 
+        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-2-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-2-F16.gguf", 
         help="Path to the model GGUF file.",
     )
 

@@ -1,7 +1,9 @@
 import numpy as np
 import torch
 import os
-from datetime import datetime, timedelta
+import re
+from warnings import warn
+from datetime import timedelta
 from typing import Tuple, Union, Optional
 from transformers import AutoTokenizer
 from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
@@ -14,7 +16,7 @@ from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
 class RealtimeAgentResources:
     def __init__(
         self, 
-        llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-2-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-2-BF16.gguf", 
+        llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-2-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-2-F16.gguf", 
         codec_model: str = "MagiCodec-50Hz-Base", 
         codec_device: Union[str, torch.device] = None,
     ):
@@ -38,9 +40,11 @@ class RealtimeAgentConfig:
     agent_identity: str = "A"
     user_identity: str = "B"
     temperature: float = 1.0
+    trans_temperature: float = 0.0
     top_k: int = 100
     top_p: float = 1.0
     min_p: float = 0.0
+    repeat_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     chunk_size_secs: float = 0.1
@@ -71,18 +75,15 @@ class RealtimeAgent:
             config = RealtimeAgentConfig()
         self.set_config(config)
 
+        self.transcript_regex = re.compile("([A-Z]):(.*?)(?= [A-Z]:|$)")
+
         self.reset()
 
     def reset(self):
         self.resources.audio_tokenizer.reset_context()
         c = self.config
 
-        self.resources.llm.init_sampler_for_generate(
-            top_k=c.top_k,
-            top_p=c.top_p,
-            min_p=c.min_p,
-            temp=c.temperature,
-        )
+        self.set_sampler()
         self.resources.llm.reset()
         
         voice_enrollment = np.zeros(self.resources.audio_tokenizer.sampling_rate * 3, dtype=np.float32) \
@@ -100,6 +101,7 @@ class RealtimeAgent:
             c.end_header_token,
         ])
         self.input_ids = self.resources.tokenizer(agent_prompt, return_tensors="pt").input_ids
+        self.input_ids_history = self.input_ids.clone()
         self.trim_pos = self.input_ids.shape[-1]
         if c.agent_opening_text:
             agent_prompt += f" {c.agent_identity}: {c.agent_opening_text}"
@@ -117,7 +119,6 @@ class RealtimeAgent:
                 "text": c.agent_opening_text,
                 "time_secs": 0.0,
             })
-        self.start_time = datetime.now()
 
     def set_config(self, config: RealtimeAgentConfig):
         self.config = config
@@ -133,12 +134,29 @@ class RealtimeAgent:
         self.end_header_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_header_token)
         self.start_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.start_audio_token)
         self.end_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_audio_token)
+        self.agent_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.agent_identity}", add_special_tokens=False)[0]
+
+    def set_sampler(self, for_trans: bool = False) -> None:
+        c = self.config
+        self.resources.llm.init_sampler_for_generate(
+            top_k=c.top_k,
+            top_p=c.top_p,
+            min_p=c.min_p,
+            temp=c.trans_temperature if for_trans else c.temperature,
+            repeat_penalty=c.repeat_penalty,
+            presence_penalty=c.presence_penalty,
+            frequency_penalty=c.frequency_penalty,
+            seed=c.seed,
+        )        
 
     def trim_sequences(self) -> None:
         if self.generated_audio_tokens > 0 and (self.generated_audio_tokens * 2) % self.max_context_frames == 0:
             audio_tokens_idx = torch.where(self.input_ids > self.end_header_token_id)[1]
             audio_tokens_idx = audio_tokens_idx[audio_tokens_idx >= self.trim_pos]
             trim_to_pos = audio_tokens_idx[self.trim_by_frames]
+            # back up the input ids about to be trimmed
+            self.input_ids_history = torch.cat([self.input_ids_history, self.input_ids[..., self.trim_pos:trim_to_pos]], dim=1)
+            # trim the input ids
             self.input_ids = torch.cat(
                 [
                     self.input_ids[..., :self.trim_pos],
@@ -146,12 +164,18 @@ class RealtimeAgent:
                 ], 
                 dim=1,
             )
+            # recompute the kv cache for all remaining tokens after the header
+            self.resources.llm.n_tokens = self.trim_pos
+            audio_mode = (self.input_ids[0, -2:] > self.end_header_token_id).all()
+            last_n = 2 if audio_mode else 1
+            self.resources.llm.eval(self.input_ids[0, self.trim_pos:-last_n].tolist())
 
     def process_audio_input_ids(self, audio_chunk_input_ids: torch.LongTensor) -> torch.LongTensor:
         out_chunk_input_ids = torch.zeros((1, 0), dtype=audio_chunk_input_ids.dtype)
         for i in range(audio_chunk_input_ids.shape[-1]):
             # trim the sequences to the maximum length
             self.trim_sequences()
+            text_start_pos = None
             while True:
                 # predict next token
                 audio_mode = (self.input_ids[0, -2:] > self.end_header_token_id).all()
@@ -167,6 +191,18 @@ class RealtimeAgent:
                     out_chunk_input_ids = torch.cat([out_chunk_input_ids, next_token], dim=1)
                     self.generated_audio_tokens += 1
                     break # move on to next input token
+                # if next token is end_audio_token, note the position
+                elif next_token[0, 0] == self.end_audio_token_id:
+                    text_start_pos = self.input_ids.shape[-1]
+                # if the previous token was end_audio_token and next token is *not* the agent speaker token,
+                # set the sampler for transcription
+                elif self.input_ids[0, -2] == self.end_audio_token_id and next_token[0, 0] != self.agent_speaker_token_id:
+                    self.set_sampler(for_trans=True)
+                # if next token is start_audio_token, update the transcript and reset the sampler for audio generation
+                elif next_token[0, 0] == self.start_audio_token_id:
+                    self.update_transcript(text_start_pos)
+                    self.set_sampler(for_trans=False)
+                    
         return out_chunk_input_ids
     
     def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
@@ -200,24 +236,39 @@ class RealtimeAgent:
             raise ValueError(f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}")
         return out_chunk
 
-    def append_transcript(self, text_input_ids: torch.LongTensor):
-        if text_input_ids is None or text_input_ids.shape[-1] == 0:
+    def update_transcript(self, text_start_pos: int) -> None:
+        if text_start_pos is None:
+            warn(
+                "No text start position found, skipping transcript update. "
+                "This means that the model did not previously generate a end_audio_token. "
+                "This should never happen - investigate this!"
+            )
             return
-        text_str = self.resources.tokenizer.decode(text_input_ids[0], skip_special_tokens=False)
-        text_str = text_str.replace(self.config.start_audio_token, "").strip()
-        speaker = ""
-        time_secs = (datetime.now() - self.start_time).total_seconds()
-        if len(text_str) > 1 and text_str[1] == ":":
-            speaker = text_str[0]
-            text_str = text_str[2:].lstrip()
-        self.transcript.append({
-            "speaker": speaker,
-            "text": text_str,
-            "time_secs": time_secs,
-        })
+        text_str = self.resources.tokenizer.decode(self.input_ids[0, text_start_pos:-1], skip_special_tokens=False)
+        # It is possible for there to be multiple speaker utterances in the same text chunk, so we extract them with regex
+        transcript_entries = []
+        for speaker, sp_text in self.transcript_regex.findall(text_str):
+            sp_text = sp_text.lstrip()
+            time_secs = self.generated_audio_tokens / self.resources.audio_tokenizer.framerate
+            # If the speaker is not the agent, the text is a transcription in audio-first interleave mode and
+            # we need to subtract the utterance length from time_secs.
+            if speaker != self.config.agent_identity:
+                pass
+            transcript_entries.append({
+                "speaker": speaker,
+                "text": sp_text,
+                "time_secs": time_secs,
+            })
+        self.transcript.extend(
+            sorted(transcript_entries, key=lambda x: x["time_secs"])
+        )
 
-    def get_sequence_str(self) -> Tuple[str, str]:
-        agent_sequence = self.resources.tokenizer.decode(self.input_ids[0], skip_special_tokens=False)
+    def get_sequence_str(self, full: bool = False) -> Tuple[str, str]:
+        if full:
+            input_ids = torch.cat([self.input_ids_history, self.input_ids[..., self.trim_pos:]], dim=1)
+        else:
+            input_ids = self.input_ids
+        agent_sequence = self.resources.tokenizer.decode(input_ids[0], skip_special_tokens=False)
         return agent_sequence
     
     def get_audio_history(self) -> np.ndarray:
