@@ -15,7 +15,7 @@
 
 # /// script
 # dependencies = [
-#     "transformers==4.54.1",
+#     "transformers==4.55.2",
 #     "albumentations >= 1.4.16",
 #     "accelerate >= 0.12.0",
 #     "torch >= 1.3",
@@ -24,6 +24,7 @@
 #     "protobuf",
 #     "evaluate",
 #     "scikit-learn",
+#     "codec_bpe",
 # ]
 # ///
 
@@ -36,7 +37,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 # -------------------------------------------------------------------------------------------------------------------
-# Adapted from https://github.com/huggingface/transformers/blob/v4.54-release/examples/pytorch/language-modeling/run_clm.py
+# Adapted from https://github.com/huggingface/transformers/blob/v4.55.2/examples/pytorch/language-modeling/run_clm.py
 # Modified for use with a line-by-line text file dataset containing tokenized audio.
 # -------------------------------------------------------------------------------------------------------------------
 
@@ -45,7 +46,6 @@ import math
 import os
 import sys
 from dataclasses import dataclass, field
-from itertools import chain
 from typing import Optional
 
 import datasets
@@ -63,7 +63,6 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
-    #default_data_collator,
     is_torch_xla_available,
     set_seed,
 )
@@ -73,11 +72,13 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 from realtime_codec_agent.utils.training_utils import DataCollatorWithIgnoredPadding
+from realtime_codec_agent.codec_llama import CodecLlamaForCausalLM, CodecLlamaConfig
+from codec_bpe import UNICODE_OFFSET_LARGE
 
 torch.set_float32_matmul_precision('high')
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.54.0")
+check_min_version("4.55.0")
 
 require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
@@ -87,6 +88,15 @@ logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+def get_model_and_config_class(model_name: str, use_codec_proj: bool):
+    if use_codec_proj:
+        model_name = model_name.lower()
+        if "llama" in model_name:
+            return CodecLlamaForCausalLM, CodecLlamaConfig
+        else:
+            raise ValueError(f"Codec projection for {model_name} not supported.")
+    else:
+        return AutoModelForCausalLM, AutoConfig
 
 @dataclass
 class ModelArguments:
@@ -162,6 +172,23 @@ class ModelArguments:
             "choices": ["auto", "bfloat16", "float16", "float32"],
         },
     )
+    codec_embed_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The codebook weights to use for codec projection with CodecLlamaForCausalLM. If None, codec projection is not used."
+            )
+        },
+    )
+    unicode_offset: int = field(
+        default=UNICODE_OFFSET_LARGE,
+        metadata={
+            "help": (
+                "The unicode index of the token at the start of the codec vocabulary. "
+                "This is used to determine which tokens should get codec projection in CodecLlamaForCausalLM."
+            )
+        },
+    )
     cache_dataset_only: bool = field(
         default=False,
         metadata={
@@ -214,16 +241,6 @@ class DataTrainingArguments:
         },
     )
     streaming: bool = field(default=False, metadata={"help": "Enable streaming mode"})
-    block_size: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Optional input sequence length after tokenization. "
-                "The training dataset will be truncated in block of this size for training. "
-                "Default to the model max input length for single sentence inputs (take into account special tokens)."
-            )
-        },
-    )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
@@ -374,7 +391,7 @@ def main():
             streaming=data_args.streaming,
             trust_remote_code=model_args.trust_remote_code,
         )
-        if training_args.do_eval and "validation" not in raw_datasets.keys():
+        if training_args.do_eval and "validation" not in raw_datasets:
             if data_args.streaming:
                 dataset_stream = load_dataset(
                     data_args.dataset_name,
@@ -428,7 +445,7 @@ def main():
             **dataset_args,
         )
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if training_args.do_eval and "validation" not in raw_datasets.keys():
+        if training_args.do_eval and "validation" not in raw_datasets:
             if data_args.streaming:
                 dataset_stream = load_dataset(
                     extension,
@@ -467,6 +484,11 @@ def main():
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
 
+    model_cls, config_cls = get_model_and_config_class(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        bool(model_args.codec_embed_file),
+    )
+
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -474,10 +496,23 @@ def main():
         "trust_remote_code": model_args.trust_remote_code,
         #"use_cache": False,
     }
+    codec_embed_weight = None
+    if model_args.codec_embed_file is not None:
+        codec_embed_weight = torch.load(model_args.codec_embed_file, map_location="cpu")
+        assert codec_embed_weight.ndim == 3, (
+            "codec_embed_file must contain a tensor of shape (num_codebooks, codebook_size, codebook_dim)"
+        )
+        config_kwargs.update({
+            "num_codebooks": codec_embed_weight.shape[0],
+            "codebook_size": codec_embed_weight.shape[1],
+            "codebook_dim": codec_embed_weight.shape[2],
+        })
+        # Flatten along the codebook axis to match the model embedding weight matrix shape
+        codec_embed_weight = codec_embed_weight.view(-1, codec_embed_weight.shape[-1])
     if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
+        config = config_cls.from_pretrained(model_args.config_name, **config_kwargs)
     elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+        config = config_cls.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
@@ -518,6 +553,13 @@ def main():
             f"({tokenizer.convert_ids_to_tokens(tokenizer.pad_token_id)})"
         )
 
+    if codec_embed_weight is not None:
+        config.codec_vocab_start = tokenizer.convert_tokens_to_ids(chr(model_args.unicode_offset))
+        logger.info(
+            f"Setting `config.codec_vocab_start` to {config.codec_vocab_start} "
+            f"({tokenizer.convert_ids_to_tokens(config.codec_vocab_start)})"
+        )
+
     if not model_args.cache_dataset_only:
         if model_args.model_name_or_path:
             torch_dtype = (
@@ -525,7 +567,7 @@ def main():
                 if model_args.torch_dtype in ["auto", None]
                 else getattr(torch, model_args.torch_dtype)
             )
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_cls.from_pretrained(
                 model_args.model_name_or_path,
                 from_tf=bool(".ckpt" in model_args.model_name_or_path),
                 config=config,
@@ -536,7 +578,7 @@ def main():
                 torch_dtype=torch_dtype,
             )
         else:
-            model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+            model = model_cls.from_config(config, trust_remote_code=model_args.trust_remote_code)
             n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
             logger.info(f"Training new model from scratch - Total size={n_params / 2**20:.2f}M params")
 
@@ -545,6 +587,12 @@ def main():
         embedding_size = model.get_input_embeddings().weight.shape[0]
         if len(tokenizer) > embedding_size:
             model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
+
+        if codec_embed_weight is not None:
+            model.model.set_codec_embeddings(codec_embed_weight)
+            logger.info(
+                f"Overwrote codec embeddings with {codec_embed_weight.dtype} tensor of shape {codec_embed_weight.shape}."
+            )
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -560,12 +608,6 @@ def main():
     def tokenize_function(examples):
         with CaptureLogger(tok_logger) as cl:
             output = tokenizer(examples[text_column_name])
-        # clm input could be much much longer than block_size
-        if "Token indices sequence length is longer than the" in cl.out:
-            tok_logger.warning(
-                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
-                " before being passed to the model."
-            )
         return output
 
     with training_args.main_process_first(desc="dataset map tokenization"):
@@ -584,74 +626,11 @@ def main():
                 batched=True,
                 remove_columns=column_names,
             )
-    if hasattr(config, "max_position_embeddings"):
-        max_pos_embeddings = config.max_position_embeddings
-    else:
-        # Define a default value if the attribute is missing in the config.
-        max_pos_embeddings = 1024
-
-    if data_args.block_size is None:
-        block_size = tokenizer.model_max_length
-        if block_size > max_pos_embeddings:
-            logger.warning(
-                f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
-                f"Using block_size={min(1024, max_pos_embeddings)} instead. You can change that default value by passing --block_size xxx."
-            )
-            if max_pos_embeddings > 0:
-                block_size = min(1024, max_pos_embeddings)
-            else:
-                block_size = 1024
-    else:
-        if data_args.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({data_args.block_size}) is larger than the maximum length for the model "
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(data_args.block_size, tokenizer.model_max_length)
-
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
-        # # Concatenate all texts.
-        # concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        # total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
-        # total_length = (total_length // block_size) * block_size
-        # # Split by chunks of max_len.
-        result = {
-            k: t #[t[i : i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in examples.items()#concatenated_examples.items()
-        }
-        if tokenizer.pad_token_id is None:
-            result["labels"] = result["input_ids"].copy()
-        return result
-
-    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
-    # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
-    # to preprocess.
-    #
-    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-    # https://huggingface.co/docs/datasets/process#map
-
-    with training_args.main_process_first(desc="grouping texts together"):
-        if not data_args.streaming:
-            lm_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc=f"Grouping texts in chunks of {block_size}",
-            )
-        else:
-            lm_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-            )
 
     if training_args.do_train:
         if "train" not in tokenized_datasets:
             raise ValueError("--do_train requires a train dataset")
-        train_dataset = lm_datasets["train"]
+        train_dataset = tokenized_datasets["train"]
         if data_args.max_train_samples is not None:
             if data_args.streaming:
                 train_dataset = train_dataset.take(data_args.max_train_samples)
@@ -662,7 +641,7 @@ def main():
     if training_args.do_eval:
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = lm_datasets["validation"]
+        eval_dataset = tokenized_datasets["validation"]
         if data_args.max_eval_samples is not None:
             if data_args.streaming:
                 eval_dataset = eval_dataset.take(data_args.max_eval_samples)

@@ -186,3 +186,5 @@ sph2pipe
 
 model.cache
 config-stt-en_fr-hf.toml
+
+*.pt

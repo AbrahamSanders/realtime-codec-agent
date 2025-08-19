@@ -158,6 +158,16 @@ class AudioTokenizer:
         output_audio = output_audio[0, 0] if self.num_channels == 1 else output_audio[0]
         return (self.sampling_rate, output_audio.cpu().numpy()), end_hanging, preroll_samples
     
+    @torch.inference_mode()
+    def get_codec_embeddings(self) -> torch.Tensor:
+        with torch.autocast(
+            device_type = "cuda",
+            dtype = torch.bfloat16,
+            enabled = self.autocast_bfloat16,
+        ):
+            codebook = self.codec_model.quantizer.codebook_proj(self.codec_model.quantizer.codebook.weight)
+        return codebook
+
     def _drop_hanging_channel_codes(self, audio_str: str) -> Tuple[str, str]:
         div_rem = len(audio_str) % self.num_channels
         if div_rem != 0:
