@@ -16,3 +16,4 @@ torch
 tqdm
 websockets
 msgpack
+jsonlines

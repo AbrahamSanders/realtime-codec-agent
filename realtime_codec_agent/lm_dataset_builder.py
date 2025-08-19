@@ -5,6 +5,7 @@ import numpy as np
 import itertools
 import re
 import random
+import os
 
 from codec_bpe.core.converter import codes_to_chars, UNICODE_OFFSET
 from codec_bpe.core.utils import get_codes_files
@@ -372,7 +373,8 @@ class LMDatasetBuilder:
         # iterate over each group of codes files
         for file_root, file_channels in tqdm(grouped_codes_files, desc="Codes file groups"):
             # load the transcript if it exists
-            transcript_file = file_root.replace(codes_path, transcripts_path) + ".txt"
+            rel_file_root = os.path.relpath(file_root, codes_path)
+            transcript_file = os.path.join(transcripts_path, f"{rel_file_root}.txt")
             transcript_lines, speakers, channel_map = load_transcript(transcript_file, self.speaker_proportion_threshold)
             
             if self.interleave_order not in [InterleaveOrder.AUDIO_ONLY, InterleaveOrder.ALL] and not transcript_lines:
@@ -424,6 +426,12 @@ class LMDatasetBuilder:
             # build the examples
             random.seed(self.voice_enrollment_selection_seed)
             for codes_str, interleave_order, agent_speaker in codes_strs:
+                metadata = {
+                    "file_id": rel_file_root,
+                    "interleave_order": interleave_order.value,
+                    "agent_speaker": agent_speaker,
+                    "example_index": 0,
+                }
                 if interleave_order == InterleaveOrder.TEXT_ONLY:
                     text_only_words = codes_str.split()
                     speaker_words = {f"{speaker}:" for speaker in speakers}
@@ -434,7 +442,8 @@ class LMDatasetBuilder:
                         # build the header
                         header = self._build_common_header(interleave_order, speakers)
                         example = f"{header}{self.header_end_token} {example}"
-                        yield example
+                        yield example, metadata.copy()
+                        metadata["example_index"] += 1
                         if end_word >= len(text_only_words):
                             break
                         start_word = end_word - self.text_only_overlap_words
@@ -467,7 +476,8 @@ class LMDatasetBuilder:
                             if agent_voice is not None:
                                 header += f"{self.header_agent_voice_token}{agent_voice}"
                         example = f"{header}{self.header_end_token}{example}"
-                        yield example
+                        yield example, metadata.copy()
+                        metadata["example_index"] += 1
                         if end_code >= len(audio_idx):
                             break
                         start_code = end_code - overlap_codes

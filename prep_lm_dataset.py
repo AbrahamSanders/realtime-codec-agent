@@ -1,6 +1,7 @@
 import argparse
 import os
 import functools
+import jsonlines
 from tqdm import tqdm
 
 from realtime_codec_agent.lm_dataset_builder import LMDatasetBuilder, InterleaveOrder
@@ -80,13 +81,18 @@ if __name__ == "__main__":
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
+    metadata_path = args.save_path.replace(".txt", "_metadata.jsonl")
+
     with open(args.save_path, "w", encoding="utf-8") as f:
-        example_iterator = lm_dataset_builder.iterate_examples(
-            args.codes_path, args.transcripts_path, args.codes_filter, args.codes_filter_exclude
-        )
-        for i, example in tqdm(enumerate(example_iterator), desc="Examples"):
-            if i == args.num_examples:
-                break
-            f.write(example)
-            f.write("\n")
+        with jsonlines.open(metadata_path, "w") as f_meta:
+            example_iterator = lm_dataset_builder.iterate_examples(
+                args.codes_path, args.transcripts_path, args.codes_filter, args.codes_filter_exclude
+            )
+            for i, (example, metadata) in tqdm(enumerate(example_iterator), desc="Examples"):
+                if i == args.num_examples:
+                    break
+                f.write(example)
+                f.write("\n")
+
+                f_meta.write(metadata)
             

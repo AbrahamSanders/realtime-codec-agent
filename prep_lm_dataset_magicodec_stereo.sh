@@ -4,3 +4,7 @@ python prep_lm_dataset.py \
     --unicode_offset=0xE000 \
     --save_path=data/audio/dataset_multi_no_bpe_magicodec_stereo_131k_80s.txt \
     --codes_filter_exclude CallHome_eng/4156 CallHome_eng/4183 CallHome_eng/4484 CallHome_eng/4852 CallFriend_eng_n/5220
+
+python tools/split_lm_dataset.py \
+    --dataset_path=data/audio/dataset_multi_no_bpe_magicodec_stereo_131k_80s.txt \
+    --file_splits_csv=data/audio/dataset_multi_no_bpe_magicodec_mono_131k_80s_file_splits.csv
