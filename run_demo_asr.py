@@ -30,7 +30,7 @@ def generate_transcript(
         audio = audio.T
     
     sequence = "<|audio_first|>"
-    sequence += "".join([f"<|speaker|>{chr(ord('A') + i % 26)}" for i in range(num_speakers)])
+    sequence += "".join([f"<|speaker|> {chr(ord('A') + i % 26)}" for i in range(num_speakers)])
     sequence += "<|end_header|>"
     sequence += "<|audio|>"
 

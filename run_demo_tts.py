@@ -36,7 +36,7 @@ def generate_audio(
     transcript_lines = [l.strip() for l in transcript.split("\n")]
     
     sequence = "<|text_first|>"
-    sequence += "".join([f"<|speaker|>{chr(ord('A') + i % 26)}" for i in range(num_speakers)])
+    sequence += "".join([f"<|speaker|> {chr(ord('A') + i % 26)}" for i in range(num_speakers)])
     sequence += "<|end_header|>"
     if context_audio is not None:
         sequence += "<|audio|>" + input_audio_str + "<|end_audio|>"

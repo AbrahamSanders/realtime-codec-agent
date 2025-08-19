@@ -65,7 +65,7 @@ def generate_audio(
         model_inputs = " " + text_prompt + "<|audio|>"
     
     header = "<|text_first|>" if interleave_text_first else "<|audio_first|>"
-    header += "".join([f"<|speaker|>{chr(ord('A') + i % 26)}" for i in range(num_speakers)])
+    header += "".join([f"<|speaker|> {chr(ord('A') + i % 26)}" for i in range(num_speakers)])
     header += "<|end_header|>"
 
     model_inputs = header + model_inputs
