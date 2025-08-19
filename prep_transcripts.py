@@ -285,9 +285,10 @@ if __name__ == "__main__":
     # Finally process all the libriheavy transcripts
     if "libriheavy" in args.sources:
         libriheavy_transcripts = []
-        with open(os.path.join(raw_transcripts_path, "libriheavy_cuts_small.jsonl"), "r", encoding="utf-8") as f:
-            for line in f:
-                libriheavy_transcripts.append(json.loads(line))
+        for jsonl_size in ["small", "medium"]:
+            with open(os.path.join(raw_transcripts_path, f"libriheavy_cuts_{jsonl_size}.jsonl"), "r", encoding="utf-8") as f:
+                for line in f:
+                    libriheavy_transcripts.append(json.loads(line))
         # sort transcripts by file and start time
         libriheavy_transcripts.sort(key=lambda x: (x["recording"]["id"], x["start"]))
         libriheavy_transcripts.append(None)
