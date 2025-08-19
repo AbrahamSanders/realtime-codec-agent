@@ -3,6 +3,7 @@ import numpy as np
 import argparse
 import logging
 import librosa
+import pandas as pd
 from datetime import datetime
 from typing import Tuple
 
@@ -54,6 +55,7 @@ def set_config_and_reset(
 def run_agent(
     input_audio: Tuple[int, np.ndarray],
     input_channel: int,
+    stream_output: bool,
     *config_args,
 ):
     sr, input_audio = input_audio
@@ -70,6 +72,7 @@ def run_agent(
     realtime_factor_sum = 0.0
     report_chunk_count = 0
     last_report_end = 0
+    realtime_factor_values = []
     for start in range(0, input_audio.shape[-1], agent.chunk_size_samples):
         end = start + agent.chunk_size_samples
         chunk = input_audio[start:end]
@@ -84,10 +87,33 @@ def run_agent(
 
         if report_chunk_count * agent.config.chunk_size_secs >= report_interval_secs or end >= input_audio.shape[-1]:
             realtime_factor = realtime_factor_sum / report_chunk_count
-            out_history = agent.get_audio_history()
-            transcript = agent.format_transcript()
-            sequence = agent.get_sequence_str()
-            yield f"{realtime_factor:.2f}x", (sr, out_history[..., last_report_end:end].T), (sr, out_history.T), transcript, sequence
+            realtime_factor_values.extend([
+                {
+                    "time": (end / sr),
+                    "realtime_factor": realtime_factor,
+                    "value": "measured",
+                },
+                {
+                    "time": (end / sr),
+                    "realtime_factor": 1.0,
+                    "value": "threshold",
+                },
+            ])
+            realtime_plot = gr.LinePlot(
+                pd.DataFrame(realtime_factor_values), 
+                x="time", 
+                y="realtime_factor",
+                y_lim=(0.5, 2.5),
+                color="value",
+            )
+            if stream_output or end >= input_audio.shape[-1]:
+                out_history = agent.get_audio_history()
+                transcript = agent.format_transcript()
+                sequence = agent.get_sequence_str()
+                out_chunk = (sr, out_history[..., last_report_end:end].T) if stream_output else None
+                yield realtime_plot, out_chunk, (sr, out_history.T), transcript, sequence,
+            else:
+                yield realtime_plot, None, None, None, None,
             realtime_factor_sum = 0.0
             report_chunk_count = 0
             last_report_end = end
@@ -115,6 +141,7 @@ if __name__ == "__main__":
         inputs=[
             gr.Audio(label="Input Audio"),
             gr.Number(0, minimum=0, maximum=1, step=1, label="Input Channel (0=left, 1=right; Ignored if mono)"),
+            gr.Checkbox(True, label="Stream Output"),
             gr.Textbox("hello how are you?", label="Agent Opening Text"),
             gr.Audio(label="Agent Voice Enrollment"),
             gr.Number(42, minimum=0, step=1, label="Random seed (0 for random)"),
@@ -131,7 +158,7 @@ if __name__ == "__main__":
             gr.Number(20.0, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
         ], 
         outputs=[
-            gr.Textbox(label="Realtime Factor"),
+            gr.LinePlot(label="Realtime Factor Plot"),
             gr.Audio(label="Audio (streaming)", streaming=True, autoplay=True),
             gr.Audio(label="Audio"),
             gr.TextArea(label="Transcript"),
