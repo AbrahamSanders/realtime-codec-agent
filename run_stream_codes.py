@@ -18,6 +18,10 @@ def stream_codes(audio, codes_file, audio_str, audio_str_is_stereo, encoding_chu
     if (audio and codes_file) or (audio and audio_str) or (codes_file and audio_str):
         raise ValueError("Only one of audio, codes_file or audio_str should be provided.")
     
+    if audio_str:
+        # get rid of any non-audio characters
+        audio_str = "".join([ch for ch in audio_str if ord(ch) >= UNICODE_OFFSET_LARGE])
+
     mono_input = False
     if audio:
         # stream-encode the audio to codes
