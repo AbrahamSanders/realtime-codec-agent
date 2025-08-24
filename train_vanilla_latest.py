@@ -589,7 +589,7 @@ def main():
             model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
 
         if codec_embed_weight is not None:
-            model.model.set_codec_embeddings(codec_embed_weight)
+            model.set_codec_embeddings(codec_embed_weight)
             logger.info(
                 f"Overwrote codec embeddings with {codec_embed_weight.dtype} tensor of shape {codec_embed_weight.shape}."
             )

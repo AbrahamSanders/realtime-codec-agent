@@ -88,41 +88,6 @@ class CodecLlamaModel(LlamaModel):
         # Initialize weights and apply final processing
         self.post_init()
     
-    def set_codec_embeddings(self, codec_embed_weight: torch.Tensor):
-        assert (
-            codec_embed_weight.shape == self.embed_codec_tokens.codec_embed.weight.shape and
-            codec_embed_weight.dtype == self.embed_codec_tokens.codec_embed.weight.dtype
-        ), (f"codec_embed_weight must be a {self.embed_codec_tokens.codec_embed.weight.dtype} tensor "
-            f"of shape {self.embed_codec_tokens.codec_embed.weight.shape}")
-        
-        codec_embed_weight = codec_embed_weight.clone(memory_format=torch.contiguous_format).to(
-            self.embed_codec_tokens.codec_embed.weight.device
-        )
-        self.embed_codec_tokens.codec_embed.weight.data = codec_embed_weight
-
-    def persist_codec_embeddings(self, batch_size: int = 1024, show_progress: bool = True):
-        num_embeddings = self.config.num_codebooks * self.config.codebook_size
-        # project each codebook vector and save it in self.embed_tokens
-        codec_input_ids = torch.arange(
-            self.config.codec_vocab_start, 
-            self.config.codec_vocab_start + num_embeddings, 
-            device=self.device,
-            dtype=torch.long,
-        )
-        with torch.no_grad():
-            if show_progress:
-                from tqdm import trange
-                range_iter = trange(0, num_embeddings, batch_size, desc="Persisting codec embeddings")
-            else:
-                range_iter = range(0, num_embeddings, batch_size)
-            for start in range_iter:
-                end = start + batch_size
-                batch_codec_input_ids = codec_input_ids[start:end]
-                proj_embeds = self.embed_codec_tokens(batch_codec_input_ids)
-                self.embed_tokens.weight.data[batch_codec_input_ids] = proj_embeds
-                # sanity check
-                assert torch.equal(self.embed_tokens(batch_codec_input_ids), proj_embeds), "proj_embeds does not match embed_tokens"
-    
     @check_model_inputs
     @auto_docstring
     def forward(
@@ -197,3 +162,45 @@ class CodecLlamaForCausalLM(LlamaForCausalLM):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def set_codec_embeddings(self, codec_embed_weight: torch.Tensor):
+        assert (
+            codec_embed_weight.shape == self.model.embed_codec_tokens.codec_embed.weight.shape and
+            codec_embed_weight.dtype == self.model.embed_codec_tokens.codec_embed.weight.dtype
+        ), (f"codec_embed_weight must be a {self.model.embed_codec_tokens.codec_embed.weight.dtype} tensor "
+            f"of shape {self.model.embed_codec_tokens.codec_embed.weight.shape}")
+        
+        codec_embed_weight = codec_embed_weight.clone(memory_format=torch.contiguous_format).to(
+            self.model.embed_codec_tokens.codec_embed.weight.device
+        )
+        self.model.embed_codec_tokens.codec_embed.weight.data = codec_embed_weight
+
+    def persist_codec_embeddings(self, batch_size: int = 1024, show_progress: bool = True):
+        # first we have to untie the embeddings from the LM head if they are tied, otherwise
+        # we end up lobotomizing the region of the LM head that corresponds to the codec tokens!
+        if getattr(self.config.get_text_config(decoder=True), "tie_word_embeddings"):
+            setattr(self.config.get_text_config(decoder=True), "tie_word_embeddings", False)
+            self._tied_weights_keys = []
+            self.lm_head.weight = torch.nn.Parameter(self.lm_head.weight.clone())
+
+        # now, project each codebook vector and save it in self.embed_tokens
+        num_embeddings = self.config.num_codebooks * self.config.codebook_size
+        codec_input_ids = torch.arange(
+            self.config.codec_vocab_start, 
+            self.config.codec_vocab_start + num_embeddings, 
+            device=self.device,
+            dtype=torch.long,
+        )
+        with torch.no_grad():
+            if show_progress:
+                from tqdm import trange
+                range_iter = trange(0, num_embeddings, batch_size, desc="Persisting codec embeddings")
+            else:
+                range_iter = range(0, num_embeddings, batch_size)
+            for start in range_iter:
+                end = start + batch_size
+                batch_codec_input_ids = codec_input_ids[start:end]
+                proj_embeds = self.model.embed_codec_tokens(batch_codec_input_ids)
+                self.model.embed_tokens.weight.data[batch_codec_input_ids] = proj_embeds
+                # sanity check
+                assert torch.equal(self.model.embed_tokens(batch_codec_input_ids), proj_embeds), "proj_embeds does not match embed_tokens"

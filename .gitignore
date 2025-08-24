@@ -175,6 +175,7 @@ persimmon-*-realtime-codec-agent*
 Mistral-*
 Qwen1.5-*
 Llama-3.2-*
+model-debug*
 
 output*.txt
 *.wav

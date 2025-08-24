@@ -1,5 +1,5 @@
 from realtime_codec_agent.codec_llama import CodecLlamaForCausalLM
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import trange
 import argparse
 import torch
@@ -24,6 +24,11 @@ if __name__ == "__main__":
         default=None,
         help="Path to the codec embedding file. If provided, it will be used to verify the codec embedding matrix."
     )
+    parser.add_argument(
+        "--save_vanilla",
+        action="store_true",
+        help="If set, saves the model as a vanilla Llama model after persisting and verifying codec embeddings."
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,7 +46,7 @@ if __name__ == "__main__":
         print("No codec embed file provided, skipping embedding weight verification.")
 
     print("Persisting codec embeddings to the main embedding matrix...")
-    model.model.persist_codec_embeddings(batch_size=args.batch_size)
+    model.persist_codec_embeddings(batch_size=args.batch_size)
     print("Codec embeddings persisted successfully. Saving the model...")
     model.save_pretrained(args.model_path)
     print("Model saved.")
@@ -71,4 +76,11 @@ if __name__ == "__main__":
             assert torch.equal(vanilla_embeds, proj_embeds), "proj_embeds does not match vanilla_embeds"
     
     print("Codec embeddings verified successfully after reload.")
+
+    if args.save_vanilla:
+        print("Saving the model as a vanilla Llama model...")
+        vanilla_model.save_pretrained(f"{args.model_path}-vanilla")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        tokenizer.save_pretrained(f"{args.model_path}-vanilla")
+        print("Vanilla Llama model saved.")
 
