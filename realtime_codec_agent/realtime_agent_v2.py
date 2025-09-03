@@ -2,9 +2,11 @@ import numpy as np
 import torch
 import os
 import re
+import time
+from dataclasses import dataclass
 from warnings import warn
-from datetime import timedelta
-from typing import Tuple, Union
+from datetime import timedelta, datetime
+from typing import Union
 from transformers import AutoTokenizer
 from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 
@@ -242,7 +244,7 @@ class RealtimeAgent:
             sorted(transcript_entries, key=lambda x: x["time_secs"])
         )
 
-    def get_sequence_str(self, full: bool = False) -> Tuple[str, str]:
+    def get_sequence_str(self, full: bool = False) -> str:
         if full:
             input_ids = torch.cat([self.input_ids_history, self.input_ids[..., self.trim_pos:]], dim=1)
         else:
@@ -259,3 +261,143 @@ class RealtimeAgent:
             f"[{timedelta(seconds=int(entry['time_secs']))}] {entry['speaker']}: {entry['text']}" for entry in self.transcript
         ])
         return formatted_transcript
+
+@dataclass
+class RealtimeAgentMultiprocessingInfo:
+    config: RealtimeAgentConfig
+    sampling_rate: int
+    chunk_size_samples: int
+    transcript: str
+    sequence: str
+    audio_history: np.ndarray
+
+class RealtimeAgentMultiprocessing:
+    def __init__(
+        self, 
+        wait_until_running: bool = True,
+        config: RealtimeAgentConfig = None,
+        idle_tol_secs: float = 1.0,
+        **resources_kwargs,
+    ):
+        import multiprocessing as mp
+        from ctypes import c_bool
+        ctx = mp.get_context("spawn")
+        self.config_queue = ctx.SimpleQueue()
+        self.info_queue = ctx.SimpleQueue()
+        self.input_queue = ctx.Queue()
+        self.output_queue = ctx.Queue()
+        self.running = ctx.Value(c_bool, False)
+        self.set_config_flag = ctx.Value(c_bool, False)
+        self.reset_flag = ctx.Value(c_bool, False)
+        self.get_info_flag = ctx.Value(c_bool, False)
+
+        self.execute_process = ctx.Process(
+            target=self.execute, 
+            daemon=True, 
+            args=(config, idle_tol_secs),
+            kwargs=resources_kwargs,
+        )
+        self.execute_process.start()
+
+        if wait_until_running:
+            self.wait_until_running()
+
+    def wait_until_running(self):
+        #TODO: use an Event instead of a loop
+        while not self.is_running():
+            time.sleep(0.01)
+
+    def is_running(self):
+        return self.running.value
+
+    def execute(self, config: RealtimeAgentConfig, idle_tol_secs: float, **resources_kwargs):
+        agent_resources = RealtimeAgentResources(**resources_kwargs)
+        agent = RealtimeAgent(resources=agent_resources, config=config)
+        last_input_time = datetime.now()
+        is_idle = False
+
+        self.running.value = True
+        print(">>> Agent is running! <<<")
+        while True:
+            try:
+                if self.set_config_flag.value:
+                    self.reset_flag.value = True
+                    config = self.config_queue.get()
+                    agent.set_config(config)
+                    self.set_config_flag.value = False
+                    print(">>> Config updated! <<<")
+
+                if self.reset_flag.value:
+                    agent.reset()
+                    self._skip_queue(self.input_queue)
+                    self.reset_flag.value = False
+                    print(">>> Agent reset! <<<")
+
+                if self.get_info_flag.value:
+                    info = RealtimeAgentMultiprocessingInfo(
+                        config=agent.config,
+                        sampling_rate=agent.resources.audio_tokenizer.sampling_rate,
+                        chunk_size_samples=agent.chunk_size_samples,
+                        transcript=agent.format_transcript(),
+                        sequence=agent.get_sequence_str(),
+                        audio_history=agent.get_audio_history(),
+                    )
+                    self.info_queue.put(info)
+                    self.get_info_flag.value = False
+                    print(">>> Info retrieved! <<<")
+
+                now = datetime.now()
+                if not self.input_queue.empty():
+                    input_audio = self.input_queue.get()
+                    output_audio = agent.process_audio(input_audio)
+                    realtime_factor = agent.profilers.total_profiler.realtime_factor_values[-1] \
+                        if agent.profilers.total_profiler.realtime_factor_values else None
+                    self.output_queue.put((output_audio, realtime_factor))
+                    if is_idle:
+                        print(">>> Agent is no longer idle! <<<")
+                    last_input_time = now
+                    is_idle = False
+                elif not is_idle:
+                    secs_since_last_input = (now - last_input_time).total_seconds()
+                    if secs_since_last_input >= idle_tol_secs:
+                        print(">>> Agent is idle! <<<")
+                        is_idle = True
+            except Exception as ex:
+                #TODO: logging here
+                print(ex)
+                #raise ex
+            
+            if is_idle:
+                time.sleep(0.05)
+
+    def _skip_queue(self, queue):
+        val = None
+        while not queue.empty():
+            val = queue.get()
+        return val
+
+    def reset(self):
+        self.reset_flag.value = True
+        #TODO: use an Event instead of a loop
+        while self.reset_flag.value:
+            time.sleep(0.01)
+
+    def set_config_and_reset(self, config):
+        self.set_config_flag.value = True
+        self.config_queue.put(config)
+        #TODO: use an Event instead of a loop
+        while self.set_config_flag.value or self.reset_flag.value:
+            time.sleep(0.01)
+
+    def get_info(self) -> RealtimeAgentMultiprocessingInfo:
+        self.get_info_flag.value = True
+        return self.info_queue.get()
+
+    def queue_input(self, input):
+        self.input_queue.put(input)
+
+    def next_output(self):
+        if self.output_queue.empty():
+            return None
+        return self.output_queue.get()
+    

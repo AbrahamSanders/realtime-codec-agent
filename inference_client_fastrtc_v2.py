@@ -1,57 +1,50 @@
 from fastrtc import StreamHandler, Stream, AdditionalOutputs
-from queue import Queue, Empty
 import logging
 import gradio as gr
 import numpy as np
 import soundfile as sf
 import argparse
 
-from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources
+from realtime_codec_agent.realtime_agent_v2 import RealtimeAgentMultiprocessing
 
 class AgentHandler(StreamHandler):
-    def __init__(self, agent: RealtimeAgent):
-        super().__init__(
-            input_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
-            output_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
-        )
+    def __init__(self, agent: RealtimeAgentMultiprocessing):
         self.agent = agent
-
         self.in_buffer = np.zeros((1, 0), dtype=np.int16)
-        self.queue = Queue()
         self.started = False
         self.last_realtime_factor = None
+
+        agent_info = self.agent.get_info()
+        self.chunk_size_samples = agent_info.chunk_size_samples
+        super().__init__(
+            input_sample_rate=agent_info.sampling_rate,
+            output_sample_rate=agent_info.sampling_rate,
+        )
 
     def receive(self, frame: tuple[int, np.ndarray]) -> None:
         if not self.started:
             return
         _, frame_audio = frame
         self.in_buffer = np.concatenate((self.in_buffer, frame_audio), axis=1)
-        if self.in_buffer.shape[-1] >= self.agent.chunk_size_samples:
-            chunk, self.in_buffer = np.split(self.in_buffer, [self.agent.chunk_size_samples], axis=1)
-            self.queue.put(chunk)
+        if self.in_buffer.shape[-1] >= self.chunk_size_samples:
+            chunk, self.in_buffer = np.split(self.in_buffer, [self.chunk_size_samples], axis=1)
+            # Suppress low amplitude noise from the microphone
+            if np.abs(chunk).max() < 100:
+                chunk = np.zeros_like(chunk)
+            print(f'Data from microphone:{chunk.shape, chunk.dtype, chunk.min(), chunk.max()}')
+            chunk = chunk.squeeze(0).astype(np.float32) / 32768.0
+            self.agent.queue_input(chunk)
 
     def emit(self) -> None:
-        try:
-            chunk = self.queue.get_nowait()
-        except Empty:
+        #get the next output
+        out_chunk = self.agent.next_output()
+        if out_chunk is None:
             return None
-        
-        # Suppress low amplitude noise from the microphone
-        if np.abs(chunk).max() < 100:
-            chunk = np.zeros_like(chunk)
-
-        print(f'Data from microphone:{chunk.shape, chunk.dtype, chunk.min(), chunk.max()}')
-
-        # Process the chunk and get the next output
-        chunk = chunk.squeeze(0).astype(np.float32) / 32768.0
-        out_chunk = self.agent.process_audio(chunk)
+        out_chunk, realtime_factor = out_chunk
         out_chunk = np.expand_dims((out_chunk * 32767.0).astype(np.int16), axis=0)
-        
         print(f'Data from model:{out_chunk.shape, out_chunk.dtype, out_chunk.min(), out_chunk.max()}')
 
         # Report if realtime factor has changed
-        realtime_factor = self.agent.profilers.total_profiler.realtime_factor_values[-1] \
-            if self.agent.profilers.total_profiler.realtime_factor_values else None
         if realtime_factor != self.last_realtime_factor:
             self.last_realtime_factor = realtime_factor
             return (self.output_sample_rate, out_chunk), AdditionalOutputs(f"{realtime_factor:.2f}x")
@@ -65,21 +58,19 @@ class AgentHandler(StreamHandler):
         if not self.started:
             print(">>> Not Started <<<")
             return
-        transcript = self.agent.format_transcript()
-        sequence = self.agent.get_sequence_str()
+        agent_info = self.agent.get_info()
         with open("output.txt", "w", encoding="utf-8") as f:
             f.write("---------------------------------------------------------------------------------------\n")
             f.write("-- Transcript:\n")
             f.write("---------------------------------------------------------------------------------------\n")
-            f.write(transcript)
+            f.write(agent_info.transcript)
             f.write("\n\n")
             f.write("---------------------------------------------------------------------------------------\n")
             f.write("-- Sequence:\n")
             f.write("---------------------------------------------------------------------------------------\n")
-            f.write(sequence)
+            f.write(agent_info.sequence)
             f.write("\n")
-        audio_history = self.agent.get_audio_history()
-        audio_history = (audio_history * 32767.0).astype(np.int16)
+        audio_history = (agent_info.audio_history * 32767.0).astype(np.int16)
         sf.write("output.wav", audio_history.T, self.output_sample_rate)
         
         self.started = False
@@ -87,6 +78,8 @@ class AgentHandler(StreamHandler):
 
     def start_up(self) -> None:
         self.set_config_and_reset()
+        agent_info = self.agent.get_info()
+        self.chunk_size_samples = agent_info.chunk_size_samples
         self.started = True
         self.last_realtime_factor = None
         print(">>> Started <<<")
@@ -94,7 +87,8 @@ class AgentHandler(StreamHandler):
     def set_config_and_reset(self):
         if not self.phone_mode:
             self.wait_for_args_sync()
-            config = self.agent.config
+            agent_info = self.agent.get_info()
+            config = agent_info.config
             config.agent_opening_text = self.latest_args[1]
             config.agent_voice_enrollment = self.latest_args[2]
             config.seed = int(self.latest_args[3]) if self.latest_args[3] else None
@@ -114,8 +108,9 @@ class AgentHandler(StreamHandler):
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
 
-            self.agent.set_config(config)
-        self.agent.reset()
+            self.agent.set_config_and_reset(config)
+        else:
+            self.agent.reset()
 
 def display_handler(component1, realtime_factor: str):
     return realtime_factor
@@ -124,11 +119,7 @@ def main(args):
     print(f"Running with args: {args}")
     logging.basicConfig(level=logging.INFO)
 
-    agent = RealtimeAgent(
-        resources=RealtimeAgentResources(
-            llm_model_path=args.llm_model_path,
-        ),
-    )
+    agent = RealtimeAgentMultiprocessing(llm_model_path=args.llm_model_path)
     handler = AgentHandler(agent)
     stream = Stream(
         handler=handler,
