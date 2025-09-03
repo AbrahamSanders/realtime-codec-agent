@@ -1,6 +1,5 @@
 from fastrtc import StreamHandler, Stream, AdditionalOutputs
 from queue import Queue, Empty
-from datetime import datetime
 import logging
 import gradio as gr
 import numpy as np
@@ -10,20 +9,17 @@ import argparse
 from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources
 
 class AgentHandler(StreamHandler):
-    def __init__(self, agent: RealtimeAgent, report_interval_secs: float = 1.0):
+    def __init__(self, agent: RealtimeAgent):
         super().__init__(
             input_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
             output_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
         )
         self.agent = agent
-        self.report_interval_secs = report_interval_secs
 
         self.in_buffer = np.zeros((1, 0), dtype=np.int16)
         self.queue = Queue()
         self.started = False
-        self.realtime_factor_sum = 0.0
-        self.report_chunk_count = 0
-        self.last_report_time = datetime.now()
+        self.last_realtime_factor = None
 
     def receive(self, frame: tuple[int, np.ndarray]) -> None:
         if not self.started:
@@ -40,8 +36,6 @@ class AgentHandler(StreamHandler):
         except Empty:
             return None
         
-        start_time = datetime.now()
-        
         # Suppress low amplitude noise from the microphone
         if np.abs(chunk).max() < 100:
             chunk = np.zeros_like(chunk)
@@ -55,24 +49,17 @@ class AgentHandler(StreamHandler):
         
         print(f'Data from model:{out_chunk.shape, out_chunk.dtype, out_chunk.min(), out_chunk.max()}')
 
-        # Compute info for reporting
-        end_time = datetime.now()
-        elapsed_secs = (end_time - start_time).total_seconds()
-        self.realtime_factor_sum += self.agent.config.chunk_size_secs / elapsed_secs
-        self.report_chunk_count += 1
-
-        # Report if enough time has passed
-        if (end_time - self.last_report_time).total_seconds() >= self.report_interval_secs:
-            realtime_factor = self.realtime_factor_sum / self.report_chunk_count
-            self.realtime_factor_sum = 0.0
-            self.report_chunk_count = 0
-            self.last_report_time = end_time
+        # Report if realtime factor has changed
+        realtime_factor = self.agent.profilers.total_profiler.realtime_factor_values[-1] \
+            if self.agent.profilers.total_profiler.realtime_factor_values else None
+        if realtime_factor != self.last_realtime_factor:
+            self.last_realtime_factor = realtime_factor
             return (self.output_sample_rate, out_chunk), AdditionalOutputs(f"{realtime_factor:.2f}x")
         
         return (self.output_sample_rate, out_chunk)
 
     def copy(self):
-        return AgentHandler(self.agent, self.report_interval_secs)
+        return AgentHandler(self.agent)
 
     def shutdown(self):
         if not self.started:
@@ -101,6 +88,7 @@ class AgentHandler(StreamHandler):
     def start_up(self) -> None:
         self.set_config_and_reset()
         self.started = True
+        self.last_realtime_factor = None
         print(">>> Started <<<")
 
     def set_config_and_reset(self):
@@ -109,16 +97,19 @@ class AgentHandler(StreamHandler):
             config = self.agent.config
             config.agent_opening_text = self.latest_args[1]
             config.agent_voice_enrollment = self.latest_args[2]
-            config.chunk_size_secs = float(self.latest_args[3])
-            config.temperature = float(self.latest_args[4])
-            config.top_k = int(self.latest_args[5])
-            config.top_p = float(self.latest_args[6])
-            config.min_p = float(self.latest_args[7])
-            config.repeat_penalty = float(self.latest_args[8])
-            config.presence_penalty = float(self.latest_args[9])
-            config.frequency_penalty = float(self.latest_args[10])
-            config.max_context_secs = float(self.latest_args[11])
-            config.trim_by_secs = float(self.latest_args[12])
+            config.seed = int(self.latest_args[3]) if self.latest_args[3] else None
+            config.chunk_size_secs = float(self.latest_args[4])
+            config.temperature = float(self.latest_args[5])
+            config.trans_temperature = float(self.latest_args[6])
+            config.top_k = int(self.latest_args[7])
+            config.top_p = float(self.latest_args[8])
+            config.min_p = float(self.latest_args[9])
+            config.repeat_penalty = float(self.latest_args[10])
+            config.presence_penalty = float(self.latest_args[11])
+            config.frequency_penalty = float(self.latest_args[12])
+            config.max_context_secs = float(self.latest_args[13])
+            config.trim_by_secs = float(self.latest_args[14])
+            config.run_profilers = bool(self.latest_args[15])
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -154,8 +145,10 @@ def main(args):
         additional_inputs=[
             gr.Textbox("hello how are you?", label="Agent Opening Text"),
             gr.Audio(label="Agent Voice Enrollment"),
+            gr.Number(42, minimum=0, step=1, label="Random seed (0 for random)"),
             gr.Slider(0.02, 1.0, value=0.1, step=0.02, label="Chunk Size (seconds)"),
             gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Temperature"),
+            gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Transcription Temperature (0 for greedy)"),
             gr.Slider(0, 500, value=100, step=1, label="Top-k"),
             gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Top-p"),
             gr.Slider(0.0, 1.0, value=0.0, step=0.001, label="Min-p"),
@@ -164,6 +157,7 @@ def main(args):
             gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Frequency Penalty"),
             gr.Number(80.0, minimum=5.0, maximum=80.0, step=5.0, label="Max Context Length (seconds)"),
             gr.Number(20.0, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
+            gr.Checkbox(True, label="Run Profilers"),
         ],
         additional_outputs=[
             gr.Textbox(label="Realtime Factor"),
@@ -176,7 +170,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Realtime Codec Agent with FastRTC.")
     parser.add_argument(
         "--llm_model_path", 
-        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-2-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-2-F16.gguf", 
+        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
         help="Path to the model GGUF file.",
     )
 

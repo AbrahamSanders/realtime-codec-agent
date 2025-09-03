@@ -190,3 +190,4 @@ config-stt-en_fr-hf.toml
 
 *.pt
 convert_hf_to_gguf.py
+realtime_factor_profile*.png

@@ -3,9 +3,8 @@ import numpy as np
 import argparse
 import logging
 import librosa
-import pandas as pd
-from datetime import datetime
 from typing import Tuple
+import matplotlib.pyplot as plt
 
 from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources
 from realtime_codec_agent.utils.audio_utils import pad_or_trim
@@ -29,6 +28,7 @@ def set_config_and_reset(
     frequency_penalty: float,
     max_context_secs: float,
     trim_by_secs: float,
+    run_profilers: bool,
 ):
     config = agent.config
     config.agent_opening_text = opening_text
@@ -45,6 +45,7 @@ def set_config_and_reset(
     config.frequency_penalty = float(frequency_penalty)
     config.max_context_secs = float(max_context_secs)
     config.trim_by_secs = float(trim_by_secs)
+    config.run_profilers = bool(run_profilers)
 
     if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
         config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -68,61 +69,31 @@ def run_agent(
 
     set_config_and_reset(*config_args)
 
-    report_interval_secs = 2.0
-    realtime_factor_sum = 0.0
-    report_chunk_count = 0
-    last_report_end = 0
-    realtime_factor_values = []
+    realtime_plot = None
     for start in range(0, input_audio.shape[-1], agent.chunk_size_samples):
         end = start + agent.chunk_size_samples
         chunk = input_audio[start:end]
         chunk = pad_or_trim(chunk, agent.chunk_size_samples)
-
-        start_time = datetime.now()
         _ = agent.process_audio(chunk)
-        end_time = datetime.now()
-        elapsed_secs = (end_time - start_time).total_seconds()
-        realtime_factor_sum += agent.config.chunk_size_secs / elapsed_secs
-        report_chunk_count += 1
 
-        if report_chunk_count * agent.config.chunk_size_secs >= report_interval_secs or end >= input_audio.shape[-1]:
-            realtime_factor = realtime_factor_sum / report_chunk_count
-            realtime_factor_values.extend([
-                {
-                    "time": (end / sr),
-                    "realtime_factor": realtime_factor,
-                    "value": "measured",
-                },
-                {
-                    "time": (end / sr),
-                    "realtime_factor": 1.0,
-                    "value": "threshold",
-                },
-            ])
-            realtime_plot = gr.LinePlot(
-                pd.DataFrame(realtime_factor_values), 
-                x="time", 
-                y="realtime_factor",
-                y_lim=(0.5, 2.5),
-                color="value",
-            )
+        if end >= input_audio.shape[-1] or end % int(sr * agent.config.profiler_report_interval_secs) == 0:
+            if agent.config.run_profilers:
+                if realtime_plot is not None:
+                    plt.close(realtime_plot)
+                realtime_plot = agent.profilers.build_plot()
             if stream_output or end >= input_audio.shape[-1]:
                 out_history = agent.get_audio_history()
                 transcript = agent.format_transcript()
                 sequence = agent.get_sequence_str()
-                out_chunk = (sr, out_history[..., last_report_end:end].T) if stream_output else None
-                yield realtime_plot, out_chunk, (sr, out_history.T), transcript, sequence,
-            else:
-                yield realtime_plot, None, None, None, None,
-            realtime_factor_sum = 0.0
-            report_chunk_count = 0
-            last_report_end = end
+                yield realtime_plot, (sr, out_history.T), transcript, sequence
+            elif realtime_plot is not None:
+                yield realtime_plot, None, None, None
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the Realtime Codec Agent debug interface.")
     parser.add_argument(
         "--llm_model_path", 
-        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-2-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-2-F16.gguf", 
+        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
         help="Path to the model GGUF file.",
     )
 
@@ -156,10 +127,10 @@ if __name__ == "__main__":
             gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Frequency Penalty"),
             gr.Number(80.0, minimum=5.0, maximum=80.0, step=5.0, label="Max Context Length (seconds)"),
             gr.Number(20.0, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
+            gr.Checkbox(True, label="Run Profilers"),
         ], 
         outputs=[
-            gr.LinePlot(label="Realtime Factor Plot"),
-            gr.Audio(label="Audio (streaming)", streaming=True, autoplay=True),
+            gr.Plot(label="Realtime Factor Plot"),
             gr.Audio(label="Audio"),
             gr.TextArea(label="Transcript"),
             gr.TextArea(label="Sequence"),

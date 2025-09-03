@@ -4,19 +4,19 @@ import os
 import re
 from warnings import warn
 from datetime import timedelta
-from typing import Tuple, Union, Optional
+from typing import Tuple, Union
 from transformers import AutoTokenizer
 from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
-from dataclasses import dataclass
 
 from .audio_tokenizer import AudioTokenizer
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
-
+from .realtime_agent_config import RealtimeAgentConfig
+from .realtime_agent_profiler import RealtimeAgentProfilerCollection
 
 class RealtimeAgentResources:
     def __init__(
         self, 
-        llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-2-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-2-F16.gguf", 
+        llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
         codec_model: str = "MagiCodec-50Hz-Base", 
         codec_device: Union[str, torch.device] = None,
     ):
@@ -32,39 +32,7 @@ class RealtimeAgentResources:
 
     def create_agent(self, config=None):
         return RealtimeAgent(resources=self, config=config)
-    
-@dataclass
-class RealtimeAgentConfig:
-    agent_opening_text: str = None
-    agent_voice_enrollment: Tuple[int, np.ndarray] = None
-    agent_identity: str = "A"
-    user_identity: str = "B"
-    temperature: float = 1.0
-    trans_temperature: float = 0.0
-    top_k: int = 100
-    top_p: float = 1.0
-    min_p: float = 0.0
-    repeat_penalty: float = 1.0
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    chunk_size_secs: float = 0.1
-    chunk_fade_secs: float = 0.02
-    max_context_secs: float = 80.0
-    trim_by_secs: float = 20.0
-    seed: Optional[int] = None
-    header_agent_token: str = "<|agent|>"
-    header_agent_voice_token: str = "<|agent_voice|>"
-    header_speaker_token: str = "<|speaker|>"
-    end_header_token: str = "<|end_header|>"
-    start_audio_token: str = "<|audio|>"
-    end_audio_token: str = "<|end_audio|>"
 
-    def __post_init__(self):
-        if int(self.chunk_size_secs*100) % 2 != 0:
-            raise ValueError("Chunk size must be a multiple of 0.02 seconds.")
-        if self.chunk_fade_secs > self.chunk_size_secs:
-            raise ValueError("Chunk fade length cannot be longer than the chunk size.")
-        
 class RealtimeAgent:
     def __init__(self, resources: RealtimeAgentResources = None, config: RealtimeAgentConfig = None):
         if resources is None:
@@ -120,6 +88,8 @@ class RealtimeAgent:
                 "time_secs": 0.0,
             })
 
+        self.profilers.reset()
+
     def set_config(self, config: RealtimeAgentConfig):
         self.config = config
         
@@ -136,6 +106,8 @@ class RealtimeAgent:
         self.end_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_audio_token)
         self.agent_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.agent_identity}", add_special_tokens=False)[0]
 
+        self.profilers = RealtimeAgentProfilerCollection(self.config)
+
     def set_sampler(self, for_trans: bool = False) -> None:
         c = self.config
         self.resources.llm.init_sampler_for_generate(
@@ -150,7 +122,8 @@ class RealtimeAgent:
         )        
 
     def trim_sequences(self) -> None:
-        if self.generated_audio_tokens > 0 and (self.generated_audio_tokens * 2) % self.max_context_frames == 0:
+        generated_frames = self.generated_audio_tokens * 2
+        if generated_frames >= self.max_context_frames and generated_frames % self.trim_by_frames == 0:
             audio_tokens_idx = torch.where(self.input_ids > self.end_header_token_id)[1]
             audio_tokens_idx = audio_tokens_idx[audio_tokens_idx >= self.trim_pos]
             trim_to_pos = audio_tokens_idx[self.trim_by_frames]
@@ -206,35 +179,41 @@ class RealtimeAgent:
         return out_chunk_input_ids
     
     def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
-        # Sanity check - input size
-        if audio_chunk.shape[-1] != self.chunk_size_samples:
-            raise ValueError(f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}")
+        with self.profilers.total_profiler:
+            # Sanity check - input size
+            if audio_chunk.shape[-1] != self.chunk_size_samples:
+                raise ValueError(f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}")
 
-        # Encode audio chunk to input ids
-        audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)
-        audio_chunk_input_ids = self.resources.tokenizer(audio_chunk_str, add_special_tokens=False, return_tensors="pt").input_ids
-        
-        # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
-        out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids)
+            # Encode audio chunk to input ids
+            with self.profilers.audio_tokenize_profiler:
+                audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)
+            with self.profilers.tokenize_profiler:
+                audio_chunk_input_ids = self.resources.tokenizer(audio_chunk_str, add_special_tokens=False, return_tensors="pt").input_ids
+            
+            # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
+            with self.profilers.lm_profiler:
+                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids)
 
-        # Decode input ids to audio chunk and append to the audio history
-        out_chunk_str = self.resources.tokenizer.decode(out_chunk_input_ids[0], skip_special_tokens=False)
-        (_, out_chunk), _, preroll_samples = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str, preroll_samples=self.crossfade_ramps[0])
-        out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
-        self.audio_history_ch1 = smooth_join(self.audio_history_ch1, out_chunk, *self.crossfade_ramps)
-        self.audio_history_ch2 = np.concatenate((self.audio_history_ch2, audio_chunk), axis=-1)
+            # Decode input ids to audio chunk and append to the audio history
+            with self.profilers.detokenize_profiler:
+                out_chunk_str = self.resources.tokenizer.decode(out_chunk_input_ids[0], skip_special_tokens=False)
+            with self.profilers.audio_detokenize_profiler:
+                (_, out_chunk), _, preroll_samples = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str, preroll_samples=self.crossfade_ramps[0])
+            out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
+            self.audio_history_ch1 = smooth_join(self.audio_history_ch1, out_chunk, *self.crossfade_ramps)
+            self.audio_history_ch2 = np.concatenate((self.audio_history_ch2, audio_chunk), axis=-1)
 
-        # Emit the output chunk from the audio history, shifted left by chunk_fade_secs.
-        # This is done because the smooth join (crossfade) modifies the tail of the previous chunk.
-        # So, we include the tail of the previous chunk in the output and exclude the tail of the current chunk.
-        out_chunk = self.audio_history_ch1[-self.chunk_size_samples-self.crossfade_ramps[0]:-self.crossfade_ramps[0]]
-        # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
-        out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples, pad_side="left")
+            # Emit the output chunk from the audio history, shifted left by chunk_fade_secs.
+            # This is done because the smooth join (crossfade) modifies the tail of the previous chunk.
+            # So, we include the tail of the previous chunk in the output and exclude the tail of the current chunk.
+            out_chunk = self.audio_history_ch1[-self.chunk_size_samples-self.crossfade_ramps[0]:-self.crossfade_ramps[0]]
+            # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
+            out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples, pad_side="left")
 
-        # Sanity check - output size
-        if out_chunk.shape[-1] != self.chunk_size_samples:
-            raise ValueError(f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}")
-        return out_chunk
+            # Sanity check - output size
+            if out_chunk.shape[-1] != self.chunk_size_samples:
+                raise ValueError(f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}")
+            return out_chunk
 
     def update_transcript(self, text_start_pos: int) -> None:
         if text_start_pos is None:
