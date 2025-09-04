@@ -12,7 +12,7 @@ from realtime_codec_agent.utils.audio_utils import pad_or_trim
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Run the Realtime Codec Agent debug interface.")
+    parser = argparse.ArgumentParser("Run the CLI-based Realtime Agent benchmarking tool.")
     parser.add_argument(
         "--llm_model_path", 
         default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
