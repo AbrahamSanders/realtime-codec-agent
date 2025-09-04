@@ -20,6 +20,7 @@ def set_config_and_reset(
     chunk_size_secs: float,
     temperature: float,
     trans_temperature: float,
+    force_trans_after_activity: bool,
     top_k: int,
     top_p: float,
     min_p: float,
@@ -37,6 +38,7 @@ def set_config_and_reset(
     config.chunk_size_secs = float(chunk_size_secs)
     config.temperature = float(temperature)
     config.trans_temperature = float(trans_temperature)
+    config.force_trans_after_activity = bool(force_trans_after_activity)
     config.top_k = int(top_k)
     config.top_p = float(top_p)
     config.min_p = float(min_p)
@@ -119,6 +121,7 @@ if __name__ == "__main__":
             gr.Slider(0.02, 1.0, value=0.1, step=0.02, label="Chunk Size (seconds)"),
             gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Temperature"),
             gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Transcription Temperature (0 for greedy)"),
+            gr.Checkbox(True, label="Force Transcription After Activity"),
             gr.Slider(0, 500, value=100, step=1, label="Top-k"),
             gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Top-p"),
             gr.Slider(0.0, 1.0, value=0.0, step=0.001, label="Min-p"),

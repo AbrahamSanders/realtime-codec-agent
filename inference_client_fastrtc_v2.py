@@ -95,15 +95,16 @@ class AgentHandler(StreamHandler):
             config.chunk_size_secs = float(self.latest_args[4])
             config.temperature = float(self.latest_args[5])
             config.trans_temperature = float(self.latest_args[6])
-            config.top_k = int(self.latest_args[7])
-            config.top_p = float(self.latest_args[8])
-            config.min_p = float(self.latest_args[9])
-            config.repeat_penalty = float(self.latest_args[10])
-            config.presence_penalty = float(self.latest_args[11])
-            config.frequency_penalty = float(self.latest_args[12])
-            config.max_context_secs = float(self.latest_args[13])
-            config.trim_by_secs = float(self.latest_args[14])
-            config.run_profilers = bool(self.latest_args[15])
+            config.force_trans_after_activity = bool(self.latest_args[7])
+            config.top_k = int(self.latest_args[8])
+            config.top_p = float(self.latest_args[9])
+            config.min_p = float(self.latest_args[10])
+            config.repeat_penalty = float(self.latest_args[11])
+            config.presence_penalty = float(self.latest_args[12])
+            config.frequency_penalty = float(self.latest_args[13])
+            config.max_context_secs = float(self.latest_args[14])
+            config.trim_by_secs = float(self.latest_args[15])
+            config.run_profilers = bool(self.latest_args[16])
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -140,6 +141,7 @@ def main(args):
             gr.Slider(0.02, 1.0, value=0.1, step=0.02, label="Chunk Size (seconds)"),
             gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Temperature"),
             gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Transcription Temperature (0 for greedy)"),
+            gr.Checkbox(True, label="Force Transcription After Activity"),
             gr.Slider(0, 500, value=100, step=1, label="Top-k"),
             gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Top-p"),
             gr.Slider(0.0, 1.0, value=0.0, step=0.001, label="Min-p"),

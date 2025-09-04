@@ -81,6 +81,7 @@ class RealtimeAgent:
 
         self.generated_tokens = 0
         self.generated_audio_tokens = 0
+        self.generated_audio_tokens_at_last_trans = 0
         self.audio_history_ch1, self.audio_history_ch2 = np.zeros((2, 0), dtype=np.float32)
         self.transcript = []
         if c.agent_opening_text:
@@ -101,12 +102,15 @@ class RealtimeAgent:
         self.max_context_frames = int(self.config.max_context_secs * self.resources.audio_tokenizer.framerate * 2)
         self.trim_by_frames = int(self.config.trim_by_secs * self.resources.audio_tokenizer.framerate * 2)
 
+        self.force_trans_margin_frames = int(self.config.force_trans_margin_secs * self.resources.audio_tokenizer.framerate * 2)
+
         self.crossfade_ramps = create_crossfade_ramps(self.resources.audio_tokenizer.sampling_rate, fade_secs=self.config.chunk_fade_secs)
 
         self.end_header_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_header_token)
         self.start_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.start_audio_token)
         self.end_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_audio_token)
         self.agent_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.agent_identity}", add_special_tokens=False)[0]
+        self.user_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.user_identity}", add_special_tokens=False)[0]
 
         self.profilers = RealtimeAgentProfilerCollection(self.config)
 
@@ -145,7 +149,7 @@ class RealtimeAgent:
             last_n = 2 if audio_mode else 1
             self.resources.llm.eval(self.input_ids[0, self.trim_pos:-last_n].tolist())
 
-    def process_audio_input_ids(self, audio_chunk_input_ids: torch.LongTensor) -> torch.LongTensor:
+    def process_audio_input_ids(self, audio_chunk_input_ids: torch.LongTensor, force_trans: bool) -> torch.LongTensor:
         out_chunk_input_ids = torch.zeros((1, 0), dtype=audio_chunk_input_ids.dtype)
         for i in range(audio_chunk_input_ids.shape[-1]):
             # trim the sequences to the maximum length
@@ -155,8 +159,13 @@ class RealtimeAgent:
                 # predict next token
                 audio_mode = (self.input_ids[0, -2:] > self.end_header_token_id).all()
                 last_n = 2 if audio_mode else 1
-                next_token = next(self.resources.llm.generate(self.input_ids[0, -last_n:].tolist(), reset=False))
-                next_token = torch.LongTensor([[next_token]])
+                if force_trans:
+                    self.resources.llm.eval(self.input_ids[0, -last_n:].tolist())
+                    next_token = torch.LongTensor([[self.end_audio_token_id if audio_mode else self.user_speaker_token_id]])
+                    force_trans = audio_mode
+                else:
+                    next_token = next(self.resources.llm.generate(self.input_ids[0, -last_n:].tolist(), reset=False))
+                    next_token = torch.LongTensor([[next_token]])
                 self.input_ids = torch.cat([self.input_ids, next_token], dim=1)
                 self.generated_tokens += 1
                 # if next token is an audio token, append the next input (user) audio token
@@ -173,13 +182,29 @@ class RealtimeAgent:
                 # set the sampler for transcription
                 elif self.input_ids[0, -2] == self.end_audio_token_id and next_token[0, 0] != self.agent_speaker_token_id:
                     self.set_sampler(for_trans=True)
+                    self.generated_audio_tokens_at_last_trans = self.generated_audio_tokens
                 # if next token is start_audio_token, update the transcript and reset the sampler for audio generation
                 elif next_token[0, 0] == self.start_audio_token_id:
                     self.update_transcript(text_start_pos)
                     self.set_sampler(for_trans=False)
                     
         return out_chunk_input_ids
-    
+
+    def should_force_transcription(self, audio_chunk: np.ndarray) -> bool:
+        if not self.config.force_trans_after_activity:
+            return False
+        last_in_chunk = self.audio_history_ch2[-self.chunk_size_samples:]
+        last_in_chunk_abs_max = 0.0 if last_in_chunk.size == 0 else np.abs(last_in_chunk).max()
+        curr_in_chunk_abs_max = np.abs(audio_chunk).max()
+
+        activity_abs_max_threshold = 100 / 32768.0
+        generated_frames = self.generated_audio_tokens * 2
+        generated_frames_at_last_trans = self.generated_audio_tokens_at_last_trans * 2
+        force_trans = last_in_chunk_abs_max >= activity_abs_max_threshold \
+            and curr_in_chunk_abs_max < activity_abs_max_threshold \
+            and (generated_frames - generated_frames_at_last_trans) > self.force_trans_margin_frames
+        return force_trans
+
     def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
         with self.profilers.total_profiler:
             # Sanity check - input size
@@ -194,7 +219,8 @@ class RealtimeAgent:
             
             # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
             with self.profilers.lm_profiler:
-                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids)
+                force_trans = self.should_force_transcription(audio_chunk)
+                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans)
 
             # Decode input ids to audio chunk and append to the audio history
             with self.profilers.detokenize_profiler:
