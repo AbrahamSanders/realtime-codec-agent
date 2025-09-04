@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from warnings import warn
 from datetime import timedelta, datetime
-from typing import Union
+from typing import Union, Optional
 from transformers import AutoTokenizer
 from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 
@@ -20,7 +20,8 @@ class RealtimeAgentResources:
         self, 
         llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
         codec_model: str = "MagiCodec-50Hz-Base", 
-        codec_device: Union[str, torch.device] = None,
+        codec_device: Optional[Union[str, torch.device]] = None,
+        whisper_model: Optional[str] = "small.en-q8_0",
     ):
         self.llm = LlamaForAlternatingCodeChannels(
             model_path=llm_model_path,
@@ -31,6 +32,10 @@ class RealtimeAgentResources:
         )
         self.tokenizer = AutoTokenizer.from_pretrained(os.path.dirname(llm_model_path))
         self.audio_tokenizer = AudioTokenizer(codec_model=codec_model, device=codec_device)
+        self.whisper_model = whisper_model
+        if self.whisper_model is not None:
+            from pywhispercpp.model import Model
+            self.whisper_model = Model(self.whisper_model)
 
     def create_agent(self, config=None):
         return RealtimeAgent(resources=self, config=config)
@@ -181,7 +186,15 @@ class RealtimeAgent:
                 # if the previous token was end_audio_token and next token is *not* the agent speaker token,
                 # set the sampler for transcription
                 elif self.input_ids[0, -2] == self.end_audio_token_id and next_token[0, 0] != self.agent_speaker_token_id:
-                    self.set_sampler(for_trans=True)
+                    trans_input_ids = None
+                    if self.config.use_whisper:
+                        trans_input_ids = self.whisper_trans()
+                    if trans_input_ids is not None:
+                        self.input_ids = torch.cat([self.input_ids, trans_input_ids, torch.LongTensor([[self.start_audio_token_id]])], dim=1)
+                        self.update_transcript(text_start_pos)
+                        self.resources.llm.eval(self.input_ids[0, text_start_pos:-1].tolist())
+                    else:
+                        self.set_sampler(for_trans=True)
                     self.generated_audio_tokens_at_last_trans = self.generated_audio_tokens
                 # if next token is start_audio_token, update the transcript and reset the sampler for audio generation
                 elif next_token[0, 0] == self.start_audio_token_id:
@@ -189,6 +202,28 @@ class RealtimeAgent:
                     self.set_sampler(for_trans=False)
                     
         return out_chunk_input_ids
+
+    def whisper_trans(self):
+        if self.resources.whisper_model is None:
+            raise ValueError("Whisper model is not loaded.")
+        trans_audio_start_secs = self.generated_audio_tokens_at_last_trans / self.resources.audio_tokenizer.framerate
+        trans_audio_start_samples = int(trans_audio_start_secs * self.resources.audio_tokenizer.sampling_rate)
+        trans_audio = self.audio_history_ch2[trans_audio_start_samples:]
+        segments = self.resources.whisper_model.transcribe(
+            trans_audio, 
+            temperature=self.config.trans_temperature,
+            language="en",
+            no_context=True, 
+            single_segment=True, 
+            print_progress=False,
+        )
+        transcription = " ".join([segment.text for segment in segments])
+        transcription = transcription.lower().replace("[blank_audio]", "").replace("...", "").replace(".", "").replace(">>", "").strip()
+        if not transcription:
+            return None
+        transcription = f": {transcription}"
+        trans_input_ids = self.resources.tokenizer(transcription, add_special_tokens=False, return_tensors="pt").input_ids
+        return trans_input_ids
 
     def should_force_transcription(self, audio_chunk: np.ndarray) -> bool:
         if not self.config.force_trans_after_activity:

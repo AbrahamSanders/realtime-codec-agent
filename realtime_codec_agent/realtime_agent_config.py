@@ -12,6 +12,7 @@ class RealtimeAgentConfig:
     trans_temperature: float = 0.0
     force_trans_after_activity: bool = True
     force_trans_margin_secs: float = 0.5
+    use_whisper: bool = True
     top_k: int = 100
     top_p: float = 1.0
     min_p: float = 0.0
