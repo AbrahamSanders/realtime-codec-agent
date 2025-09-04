@@ -71,40 +71,45 @@ class RealtimeAgentProfilerCollection:
         )
         fig, ax = plt.subplots(figsize=(14, 4))
         ax.plot(x, self.total_profiler.realtime_factor_values, label="total", color="C0")
-        ax.plot(x, self.tokenize_profiler.realtime_factor_values, label="tokenize", color="C1")
-        ax.plot(x, self.detokenize_profiler.realtime_factor_values, label="detokenize", color="C2")
-        ax.plot(x, self.audio_tokenize_profiler.realtime_factor_values, label="audio_tokenize", color="C3")
-        ax.plot(x, self.audio_detokenize_profiler.realtime_factor_values, label="audio_detokenize", color="C4")
-        ax.plot(x, self.lm_profiler.realtime_factor_values, label="lm", color="C5")
-        ax.set_title("Realtime Factor Profile")
-        ax.set_xlabel("Time (seconds)")
-        ax.set_ylabel("Realtime factor")
-        ax.set_ylim(*ylim)
-        ax.axhline(y=1.0, xmin=0.05, xmax=0.95, color='orange', linestyle='--', linewidth=2.5, label='threshold')
         ax.axhline(
             y=np.median(self.total_profiler.realtime_factor_values), 
             xmin=0.05, xmax=0.95, color='C0', linestyle='--', linewidth=1.5, label='total (median)'
         )
-        ax.axhline(
-            y=np.median(self.tokenize_profiler.realtime_factor_values), 
-            xmin=0.05, xmax=0.95, color='C1', linestyle='--', linewidth=1.5, label='tokenize (median)'
-        )
-        ax.axhline(
-            y=np.median(self.detokenize_profiler.realtime_factor_values), 
-            xmin=0.05, xmax=0.95, color='C2', linestyle='--', linewidth=1.5, label='detokenize (median)'
-        )
-        ax.axhline(
-            y=np.median(self.audio_tokenize_profiler.realtime_factor_values), 
-            xmin=0.05, xmax=0.95, color='C3', linestyle='--', linewidth=1.5, label='audio_tokenize (median)'
-        )
-        ax.axhline(
-            y=np.median(self.audio_detokenize_profiler.realtime_factor_values), 
-            xmin=0.05, xmax=0.95, color='C4', linestyle='--', linewidth=1.5, label='audio_detokenize (median)'
-        )
-        ax.axhline(
-            y=np.median(self.lm_profiler.realtime_factor_values), 
-            xmin=0.05, xmax=0.95, color='C5', linestyle='--', linewidth=1.5, label='lm (median)'
-        )
+        if self.tokenize_profiler.realtime_factor_values:
+            ax.plot(x, self.tokenize_profiler.realtime_factor_values, label="tokenize", color="C1")
+            ax.axhline(
+                y=np.median(self.tokenize_profiler.realtime_factor_values), 
+                xmin=0.05, xmax=0.95, color='C1', linestyle='--', linewidth=1.5, label='tokenize (median)'
+            )
+        if self.detokenize_profiler.realtime_factor_values:
+            ax.plot(x, self.detokenize_profiler.realtime_factor_values, label="detokenize", color="C2")
+            ax.axhline(
+                y=np.median(self.detokenize_profiler.realtime_factor_values), 
+                xmin=0.05, xmax=0.95, color='C2', linestyle='--', linewidth=1.5, label='detokenize (median)'
+            )
+        if self.audio_tokenize_profiler.realtime_factor_values:
+            ax.plot(x, self.audio_tokenize_profiler.realtime_factor_values, label="audio_tokenize", color="C3")
+            ax.axhline(
+                y=np.median(self.audio_tokenize_profiler.realtime_factor_values), 
+                xmin=0.05, xmax=0.95, color='C3', linestyle='--', linewidth=1.5, label='audio_tokenize (median)'
+            )
+        if self.audio_detokenize_profiler.realtime_factor_values:
+            ax.plot(x, self.audio_detokenize_profiler.realtime_factor_values, label="audio_detokenize", color="C4")
+            ax.axhline(
+                y=np.median(self.audio_detokenize_profiler.realtime_factor_values), 
+                xmin=0.05, xmax=0.95, color='C4', linestyle='--', linewidth=1.5, label='audio_detokenize (median)'
+            )
+        if self.lm_profiler.realtime_factor_values:
+            ax.plot(x, self.lm_profiler.realtime_factor_values, label="lm", color="C5")
+            ax.axhline(
+                y=np.median(self.lm_profiler.realtime_factor_values), 
+                xmin=0.05, xmax=0.95, color='C5', linestyle='--', linewidth=1.5, label='lm (median)'
+            )
+        ax.axhline(y=1.0, xmin=0.05, xmax=0.95, color='orange', linestyle='--', linewidth=2.5, label='threshold')
+        ax.set_title("Realtime Factor Profile")
+        ax.set_xlabel("Time (seconds)")
+        ax.set_ylabel("Realtime factor")
+        ax.set_ylim(*ylim)
         ax.grid(True)
         fig.legend(loc='outside center right')
         return fig
