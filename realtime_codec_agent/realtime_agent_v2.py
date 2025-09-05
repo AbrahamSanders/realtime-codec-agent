@@ -400,7 +400,7 @@ class RealtimeAgentMultiprocessing:
                         sampling_rate=agent.resources.audio_tokenizer.sampling_rate,
                         chunk_size_samples=agent.chunk_size_samples,
                         transcript=agent.format_transcript(),
-                        sequence=agent.get_sequence_str(),
+                        sequence=agent.get_sequence_str(full=True),
                         audio_history=agent.get_audio_history(),
                     )
                     self.info_queue.put(info)
