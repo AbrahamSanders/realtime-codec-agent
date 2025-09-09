@@ -3,6 +3,8 @@ import torch
 import os
 import re
 import time
+from scipy.special import softmax
+from collections import deque
 from dataclasses import dataclass
 from warnings import warn
 from datetime import timedelta, datetime
@@ -11,9 +13,10 @@ from transformers import AutoTokenizer
 from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 
 from .audio_tokenizer import AudioTokenizer
-from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
+from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
 from .realtime_agent_config import RealtimeAgentConfig
 from .realtime_agent_profiler import RealtimeAgentProfilerCollection
+from .external_llm import get_external_llm_messages
 
 class RealtimeAgentResources:
     def __init__(
@@ -21,7 +24,7 @@ class RealtimeAgentResources:
         llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
         codec_model: str = "MagiCodec-50Hz-Base", 
         codec_device: Optional[Union[str, torch.device]] = None,
-        whisper_model: Optional[str] = "small.en-q8_0",
+        whisper_model: Optional[str] = "small.en",
     ):
         self.llm = LlamaForAlternatingCodeChannels(
             model_path=llm_model_path,
@@ -51,6 +54,7 @@ class RealtimeAgent:
         self.set_config(config)
 
         self.transcript_regex = re.compile("([A-Z]):(.*?)(?= [A-Z]:|$)")
+        self.sentence_split_regex = re.compile("(?<=[.!?:]) ")
 
         self.reset()
 
@@ -87,6 +91,9 @@ class RealtimeAgent:
         self.generated_tokens = 0
         self.generated_audio_tokens = 0
         self.generated_audio_tokens_at_last_trans = 0
+        self.ch1_inactivity_elapsed_secs = 0.0
+        self.ch2_inactivity_elapsed_secs = 0.0
+        self.can_force_trans = False
         self.audio_history_ch1, self.audio_history_ch2 = np.zeros((2, 0), dtype=np.float32)
         self.transcript = []
         if c.agent_opening_text:
@@ -96,6 +103,7 @@ class RealtimeAgent:
                 "time_secs": 0.0,
             })
 
+        self.external_response_queue = deque()
         self.profilers.reset()
 
     def set_config(self, config: RealtimeAgentConfig):
@@ -107,8 +115,6 @@ class RealtimeAgent:
         self.max_context_frames = int(self.config.max_context_secs * self.resources.audio_tokenizer.framerate * 2)
         self.trim_by_frames = int(self.config.trim_by_secs * self.resources.audio_tokenizer.framerate * 2)
 
-        self.force_trans_margin_frames = int(self.config.force_trans_margin_secs * self.resources.audio_tokenizer.framerate * 2)
-
         self.crossfade_ramps = create_crossfade_ramps(self.resources.audio_tokenizer.sampling_rate, fade_secs=self.config.chunk_fade_secs)
 
         self.end_header_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_header_token)
@@ -116,6 +122,14 @@ class RealtimeAgent:
         self.end_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_audio_token)
         self.agent_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.agent_identity}", add_special_tokens=False)[0]
         self.user_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.user_identity}", add_special_tokens=False)[0]
+
+        self.client = None
+        if self.config.use_external_llm:
+            from openai import OpenAI
+            self.client = OpenAI(
+                api_key=self.config.external_llm_api_key, 
+                base_url=self.config.external_llm_base_url,
+            )
 
         self.profilers = RealtimeAgentProfilerCollection(self.config)
 
@@ -154,7 +168,7 @@ class RealtimeAgent:
             last_n = 2 if audio_mode else 1
             self.resources.llm.eval(self.input_ids[0, self.trim_pos:-last_n].tolist())
 
-    def process_audio_input_ids(self, audio_chunk_input_ids: torch.LongTensor, force_trans: bool) -> torch.LongTensor:
+    def process_audio_input_ids(self, audio_chunk_input_ids: torch.LongTensor, force_trans: bool, force_response: bool) -> torch.LongTensor:
         out_chunk_input_ids = torch.zeros((1, 0), dtype=audio_chunk_input_ids.dtype)
         for i in range(audio_chunk_input_ids.shape[-1]):
             # trim the sequences to the maximum length
@@ -164,10 +178,14 @@ class RealtimeAgent:
                 # predict next token
                 audio_mode = (self.input_ids[0, -2:] > self.end_header_token_id).all()
                 last_n = 2 if audio_mode else 1
-                if force_trans:
+                if force_trans or force_response:
                     self.resources.llm.eval(self.input_ids[0, -last_n:].tolist())
-                    next_token = torch.LongTensor([[self.end_audio_token_id if audio_mode else self.user_speaker_token_id]])
-                    force_trans = audio_mode
+                    if force_trans:
+                        next_token = torch.LongTensor([[self.end_audio_token_id if audio_mode else self.user_speaker_token_id]])
+                        force_trans = audio_mode
+                    else:
+                        next_token = torch.LongTensor([[self.end_audio_token_id if audio_mode else self.agent_speaker_token_id]])
+                        force_response = audio_mode        
                 else:
                     next_token = next(self.resources.llm.generate(self.input_ids[0, -last_n:].tolist(), reset=False))
                     next_token = torch.LongTensor([[next_token]])
@@ -184,7 +202,7 @@ class RealtimeAgent:
                 elif next_token[0, 0] == self.end_audio_token_id:
                     text_start_pos = self.input_ids.shape[-1]
                 # if the previous token was end_audio_token and next token is *not* the agent speaker token,
-                # set the sampler for transcription
+                # transcribe with whisper or set the sampler for native transcription
                 elif self.input_ids[0, -2] == self.end_audio_token_id and next_token[0, 0] != self.agent_speaker_token_id:
                     trans_input_ids = None
                     if self.config.use_whisper:
@@ -196,6 +214,29 @@ class RealtimeAgent:
                     else:
                         self.set_sampler(for_trans=True)
                     self.generated_audio_tokens_at_last_trans = self.generated_audio_tokens
+                    self.external_response_queue.clear()
+                    self.can_force_trans = False
+                # if the previous token was end_audio_token and next token *is* the agent speaker token, prepare to generate agent utterance text.
+                # if use_external_llm is True, call the external LLM now instead of generating the agent utterance text natively
+                elif self.input_ids[0, -2] == self.end_audio_token_id and next_token[0, 0] == self.agent_speaker_token_id:
+                    response_suppressed = False
+                    if self.config.use_external_llm:
+                        speaker_logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
+                        user_prob = softmax(speaker_logits)[self.user_speaker_token_id]
+                        if user_prob < self.config.external_llm_suppress_threshold:
+                            response_input_ids = self.call_external_llm()
+                            if response_input_ids is not None:
+                                self.input_ids = torch.cat([self.input_ids, response_input_ids, torch.LongTensor([[self.start_audio_token_id]])], dim=1)
+                                self.update_transcript(text_start_pos)
+                                self.resources.llm.eval(self.input_ids[0, text_start_pos:-1].tolist())
+                        else:
+                            self.input_ids = self.input_ids[..., :-2]
+                            self.resources.llm.n_tokens -= 3
+                            response_suppressed = True
+                    if not response_suppressed:
+                        # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
+                        # this prevents duplicate responses when self.config.force_response_after_inactivity_secs > 0.0.
+                        self.ch1_inactivity_elapsed_secs = 0.0
                 # if next token is start_audio_token, update the transcript and reset the sampler for audio generation
                 elif next_token[0, 0] == self.start_audio_token_id:
                     self.update_transcript(text_start_pos)
@@ -218,27 +259,71 @@ class RealtimeAgent:
             print_progress=False,
         )
         transcription = " ".join([segment.text for segment in segments])
-        transcription = transcription.lower().replace("[blank_audio]", "").replace("...", "").replace(".", "").replace(">>", "").strip()
+        transcription = transcription.lower().replace("[blank_audio]", "").replace("...", "").replace(",", "").replace(".", "").replace(">>", "").strip()
         if not transcription:
             return None
         transcription = f": {transcription}"
         trans_input_ids = self.resources.tokenizer(transcription, add_special_tokens=False, return_tensors="pt").input_ids
         return trans_input_ids
 
-    def should_force_transcription(self, audio_chunk: np.ndarray) -> bool:
-        if not self.config.force_trans_after_activity:
-            return False
-        last_in_chunk = self.audio_history_ch2[-self.chunk_size_samples:]
-        last_in_chunk_abs_max = 0.0 if last_in_chunk.size == 0 else np.abs(last_in_chunk).max()
-        curr_in_chunk_abs_max = np.abs(audio_chunk).max()
+    def call_external_llm(self) -> torch.LongTensor:
+        if len(self.external_response_queue) == 0:
+            if self.client is None:
+                raise ValueError("External LLM client is not initialized.")
+            messages = get_external_llm_messages(
+                self.client.base_url.host, 
+                self.config.external_llm_instructions, 
+                self.transcript, 
+                self.config.agent_identity,
+            )
+            response = self.client.chat.completions.create(
+                model=self.config.external_llm_model,
+                messages=messages,
+                max_tokens=100,
+                top_p=self.config.external_llm_top_p,
+            )
+            response_text = response.choices[0].message.content
+            response_text = response_text.lower().replace("\n", " ").strip()
+            if response_text == "[silence]":
+                return None
+            # Split the response into sentences and enqueue them
+            sentences = self.sentence_split_regex.split(response_text)
+            sentences = [s.replace(",", "").replace(".", "").strip() for s in sentences]
+            sentences = [s for s in sentences if s]
+            if not sentences:
+                return None
+            self.external_response_queue.extend(sentences)
+        response_text = self.external_response_queue.popleft()
+        response_text = f": {response_text}"
+        response_input_ids = self.resources.tokenizer(response_text, add_special_tokens=False, return_tensors="pt").input_ids
+        return response_input_ids
 
-        activity_abs_max_threshold = 100 / 32768.0
-        generated_frames = self.generated_audio_tokens * 2
-        generated_frames_at_last_trans = self.generated_audio_tokens_at_last_trans * 2
-        force_trans = last_in_chunk_abs_max >= activity_abs_max_threshold \
-            and curr_in_chunk_abs_max < activity_abs_max_threshold \
-            and (generated_frames - generated_frames_at_last_trans) > self.force_trans_margin_frames
-        return force_trans
+    def update_inactivity_timers(self, audio_chunk: np.ndarray) -> None:
+        # channel 2 (input)
+        curr_in_chunk_abs_max = np.abs(audio_chunk).max()
+        if curr_in_chunk_abs_max >= self.config.activity_abs_max_threshold:
+            self.ch2_inactivity_elapsed_secs = 0.0
+            self.can_force_trans = True
+        else:
+            self.ch2_inactivity_elapsed_secs += self.config.chunk_size_secs
+        
+        # channel 1 (output)
+        curr_out_chunk = self.audio_history_ch1[-self.chunk_size_samples:]
+        curr_out_chunk_abs_max = 0.0 if curr_out_chunk.size == 0 else np.abs(curr_out_chunk).max()
+        if curr_out_chunk_abs_max >= self.config.activity_abs_max_threshold:
+            self.ch1_inactivity_elapsed_secs = 0.0
+        else:
+            self.ch1_inactivity_elapsed_secs += self.config.chunk_size_secs
+
+    def should_force_transcription(self) -> bool:
+        if self.config.force_trans_after_inactivity_secs == 0.0 or not self.can_force_trans:
+            return False
+        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs
+    
+    def should_force_response(self) -> bool:
+        if self.config.force_response_after_inactivity_secs == 0.0:
+            return False
+        return min(self.ch1_inactivity_elapsed_secs, self.ch2_inactivity_elapsed_secs) >= self.config.force_response_after_inactivity_secs
 
     def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
         with self.profilers.total_profiler:
@@ -254,8 +339,10 @@ class RealtimeAgent:
             
             # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
             with self.profilers.lm_profiler:
-                force_trans = self.should_force_transcription(audio_chunk)
-                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans)
+                self.update_inactivity_timers(audio_chunk)
+                force_trans = self.should_force_transcription()
+                force_response = self.should_force_response()
+                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans, force_response)
 
             # Decode input ids to audio chunk and append to the audio history
             with self.profilers.detokenize_profiler:
@@ -263,6 +350,8 @@ class RealtimeAgent:
             with self.profilers.audio_detokenize_profiler:
                 (_, out_chunk), _, preroll_samples = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str, preroll_samples=self.crossfade_ramps[0])
             out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
+            if self.config.target_volume_rms > 0:
+                out_chunk = normalize_audio_rms(out_chunk, target_rms=self.config.target_volume_rms)
             self.audio_history_ch1 = smooth_join(self.audio_history_ch1, out_chunk, *self.crossfade_ramps)
             self.audio_history_ch2 = np.concatenate((self.audio_history_ch2, audio_chunk), axis=-1)
 

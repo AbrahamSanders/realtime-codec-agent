@@ -95,7 +95,7 @@ class AgentHandler(StreamHandler):
             config.chunk_size_secs = float(self.latest_args[4])
             config.temperature = float(self.latest_args[5])
             config.trans_temperature = float(self.latest_args[6])
-            config.force_trans_after_activity = bool(self.latest_args[7])
+            config.force_trans_after_inactivity_secs = float(self.latest_args[7])
             config.use_whisper = bool(self.latest_args[8])
             config.top_k = int(self.latest_args[9])
             config.top_p = float(self.latest_args[10])
@@ -105,7 +105,11 @@ class AgentHandler(StreamHandler):
             config.frequency_penalty = float(self.latest_args[14])
             config.max_context_secs = float(self.latest_args[15])
             config.trim_by_secs = float(self.latest_args[16])
-            config.run_profilers = bool(self.latest_args[17])
+            config.target_volume_rms = float(self.latest_args[17])
+            config.force_response_after_inactivity_secs = float(self.latest_args[18])
+            config.use_external_llm = bool(self.latest_args[19])
+            config.external_llm_instructions = self.latest_args[20]
+            config.run_profilers = bool(self.latest_args[21])
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -122,6 +126,8 @@ def main(args):
     logging.basicConfig(level=logging.INFO)
 
     agent = RealtimeAgentMultiprocessing(llm_model_path=args.llm_model_path)
+    agent_info = agent.get_info()
+    config = agent_info.config
     handler = AgentHandler(agent)
     stream = Stream(
         handler=handler,
@@ -136,23 +142,32 @@ def main(args):
         modality="audio", 
         mode="send-receive",
         additional_inputs=[
-            gr.Textbox("hello how are you?", label="Agent Opening Text"),
-            gr.Audio(label="Agent Voice Enrollment"),
-            gr.Number(42, minimum=0, step=1, label="Random seed (0 for random)"),
-            gr.Slider(0.02, 1.0, value=0.1, step=0.02, label="Chunk Size (seconds)"),
-            gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Temperature"),
-            gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Transcription Temperature (0 for greedy)"),
-            gr.Checkbox(True, label="Force Transcription After Activity"),
-            gr.Checkbox(True, label="Use Whisper for Transcription"),
-            gr.Slider(0, 500, value=100, step=1, label="Top-k"),
-            gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Top-p"),
-            gr.Slider(0.0, 1.0, value=0.0, step=0.001, label="Min-p"),
-            gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Repeat Penalty"),
-            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Presence Penalty"),
-            gr.Slider(-2.0, 2.0, value=0.0, step=0.05, label="Frequency Penalty"),
-            gr.Number(80.0, minimum=5.0, maximum=80.0, step=5.0, label="Max Context Length (seconds)"),
-            gr.Number(20.0, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
-            gr.Checkbox(True, label="Run Profilers"),
+            gr.Textbox(config.agent_opening_text, label="Agent Opening Text"),
+            gr.Audio(
+                (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T) 
+                    if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2 
+                    else config.agent_voice_enrollment, 
+                label="Agent Voice Enrollment",
+            ),
+            gr.Number(config.seed, minimum=0, step=1, label="Random seed (0 for random)"),
+            gr.Slider(0.02, 1.0, value=config.chunk_size_secs, step=0.02, label="Chunk Size (seconds)"),
+            gr.Slider(0.0, 2.0, value=config.temperature, step=0.05, label="Temperature"),
+            gr.Slider(0.0, 1.0, value=config.trans_temperature, step=0.05, label="Transcription Temperature (0 for greedy)"),
+            gr.Slider(0.0, 10.0, value=config.force_trans_after_inactivity_secs, step=0.1, label="Force Transcription After Inactivity (seconds, 0 to disable)"),
+            gr.Checkbox(config.use_whisper, label="Use Whisper for Transcription"),
+            gr.Slider(0, 500, value=config.top_k, step=1, label="Top-k"),
+            gr.Slider(0.0, 1.0, value=config.top_p, step=0.01, label="Top-p"),
+            gr.Slider(0.0, 1.0, value=config.min_p, step=0.001, label="Min-p"),
+            gr.Slider(0.0, 2.0, value=config.repeat_penalty, step=0.05, label="Repeat Penalty"),
+            gr.Slider(-2.0, 2.0, value=config.presence_penalty, step=0.05, label="Presence Penalty"),
+            gr.Slider(-2.0, 2.0, value=config.frequency_penalty, step=0.05, label="Frequency Penalty"),
+            gr.Number(config.max_context_secs, minimum=5.0, maximum=80.0, step=5.0, label="Max Context Length (seconds)"),
+            gr.Number(config.trim_by_secs, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
+            gr.Slider(0.0, 0.1, value=config.target_volume_rms, step=0.01, label="Volume Normalization (0 to disable)"),
+            gr.Slider(0.0, 10.0, value=config.force_response_after_inactivity_secs, step=0.1, label="Force Response After Inactivity (seconds, 0 to disable)"),
+            gr.Checkbox(config.use_external_llm, label=f"Use External LLM ({config.external_llm_model})"),
+            gr.TextArea(config.external_llm_instructions, label="External LLM Instructions"),
+            gr.Checkbox(config.run_profilers, label="Run Profilers"),
         ],
         additional_outputs=[
             gr.Textbox(label="Realtime Factor"),
