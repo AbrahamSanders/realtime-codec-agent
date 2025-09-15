@@ -69,7 +69,6 @@ def run_agent(
     input_audio: Tuple[int, np.ndarray],
     input_channel: int,
     stream_output: bool,
-    keep_full_sequence: bool,
     *config_args,
 ):
     sr, input_audio = input_audio
@@ -97,7 +96,7 @@ def run_agent(
             if stream_output or end >= input_audio.shape[-1]:
                 out_history = agent.get_audio_history()
                 transcript = agent.format_transcript()
-                sequence = agent.get_sequence_str(full=keep_full_sequence)
+                sequence = agent.get_sequence_str()
                 yield realtime_plot, (sr, out_history.T), transcript, sequence
             elif realtime_plot is not None:
                 yield realtime_plot, None, None, None
@@ -127,7 +126,6 @@ if __name__ == "__main__":
             gr.Audio(label="Input Audio"),
             gr.Number(0, minimum=0, maximum=1, step=1, label="Input Channel (0=left, 1=right; Ignored if mono)"),
             gr.Checkbox(True, label="Stream Output"),
-            gr.Checkbox(False, label="Keep Full Sequence History"),
             gr.Textbox(config.agent_opening_text, label="Agent Opening Text"),
             gr.Audio(
                 (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T) 

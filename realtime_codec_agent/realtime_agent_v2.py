@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 from warnings import warn
 from datetime import timedelta, datetime
-from typing import Union, Optional, List
+from typing import Union, Optional, List, Dict, Any
 from transformers import AutoTokenizer
 from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 
@@ -58,6 +58,24 @@ class RealtimeAgent:
 
         self.reset()
 
+    @property
+    def total_secs(self) -> float:
+        return len(self.audio_tokens_idx) / (self.resources.audio_tokenizer.framerate * 2)
+
+    @property
+    def last_transcription(self) -> Optional[Dict[str, Any]]:
+        for entry in reversed(self.transcript):
+            if entry["speaker"] != self.config.agent_identity:
+                return entry
+        return None
+    
+    @property
+    def last_response(self) -> Optional[Dict[str, Any]]:
+        for entry in reversed(self.transcript):
+            if entry["speaker"] == self.config.agent_identity:
+                return entry
+        return None
+
     def reset(self):
         self.resources.audio_tokenizer.reset_context()
         c = self.config
@@ -80,27 +98,26 @@ class RealtimeAgent:
             c.end_header_token,
         ])
         self.input_ids = self.resources.tokenizer.encode(agent_prompt)
-        self.input_ids_history = self.input_ids.copy()
-        self.trim_pos = len(self.input_ids)
+        self.context_start_pos = len(self.input_ids)
         if c.agent_opening_text:
             agent_prompt += f" {c.agent_identity}: {c.agent_opening_text}"
         agent_prompt += c.start_audio_token
         self.input_ids = self.resources.tokenizer.encode(agent_prompt)
         self.resources.llm.eval(self.input_ids[:-1])
 
-        self.generated_tokens = 0
-        self.generated_audio_tokens = 0
-        self.generated_audio_tokens_at_last_trans = 0
+        self.trim_to_secs = 0.0
         self.ch1_inactivity_elapsed_secs = 0.0
         self.ch2_inactivity_elapsed_secs = 0.0
         self.can_force_trans = False
         self.audio_history_ch1, self.audio_history_ch2 = np.zeros((2, 0), dtype=np.float32)
+        self.audio_tokens_idx = []
         self.transcript = []
         if c.agent_opening_text:
             self.transcript.append({
                 "speaker": c.agent_identity,
                 "text": c.agent_opening_text,
                 "time_secs": 0.0,
+                "text_start_pos": self.context_start_pos,
             })
 
         self.external_response_queue = deque()
@@ -110,11 +127,6 @@ class RealtimeAgent:
         self.config = config
         
         self.chunk_size_samples = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.sampling_rate)
-        self.chunk_size_frames = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.framerate * 2)
-
-        self.max_context_frames = int(self.config.max_context_secs * self.resources.audio_tokenizer.framerate * 2)
-        self.trim_by_frames = int(self.config.trim_by_secs * self.resources.audio_tokenizer.framerate * 2)
-
         self.crossfade_ramps = create_crossfade_ramps(self.resources.audio_tokenizer.sampling_rate, fade_secs=self.config.chunk_fade_secs)
 
         self.end_header_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_header_token)
@@ -147,19 +159,15 @@ class RealtimeAgent:
         )        
 
     def trim_sequences(self) -> None:
-        generated_frames = self.generated_audio_tokens * 2
-        if generated_frames >= self.max_context_frames and generated_frames % self.trim_by_frames == 0:
-            audio_tokens_idx = [i for i in range(len(self.input_ids)) if self.input_ids[i] > self.end_header_token_id and i >= self.trim_pos]
-            trim_to_pos = audio_tokens_idx[self.trim_by_frames]
-            # back up the input ids about to be trimmed
-            self.input_ids_history.extend(self.input_ids[self.trim_pos:trim_to_pos])
-            # trim the input ids
-            self.input_ids = self.input_ids[:self.trim_pos] + self.input_ids[trim_to_pos:]
-            # recompute the kv cache for all remaining tokens after the header
-            self.resources.llm.n_tokens = self.trim_pos
+        if self.total_secs - self.trim_to_secs >= self.config.max_context_secs:
+            self.trim_to_secs += self.config.trim_by_secs
+            trim_to_frames = self.frames_from_secs(self.trim_to_secs)
+            trim_to_pos = self.audio_tokens_idx[trim_to_frames]
+            # recompute the kv cache
+            self.resources.llm.n_tokens = self.context_start_pos
             audio_mode = all([t > self.end_header_token_id for t in self.input_ids[-2:]])
             last_n = 2 if audio_mode else 1
-            self.resources.llm.eval(self.input_ids[self.trim_pos:-last_n])
+            self.resources.llm.eval(self.input_ids[trim_to_pos:-last_n])
 
     def process_audio_input_ids(self, audio_chunk_input_ids: List[int], force_trans: bool, force_response: bool) -> List[int]:
         out_chunk_input_ids = [0] * len(audio_chunk_input_ids)
@@ -182,12 +190,11 @@ class RealtimeAgent:
                 else:
                     next_token = next(self.resources.llm.generate(self.input_ids[-last_n:], reset=False))
                 self.input_ids.append(next_token)
-                self.generated_tokens += 1
                 # if next token is an audio token, append the next input (user) audio token
                 if next_token > self.end_header_token_id:
                     self.input_ids.append(audio_chunk_input_ids[i])
+                    self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
                     out_chunk_input_ids[i] = next_token
-                    self.generated_audio_tokens += 1
                     break # move on to next input token
                 # if next token is end_audio_token, note the position
                 elif next_token == self.end_audio_token_id:
@@ -204,7 +211,6 @@ class RealtimeAgent:
                         self.resources.llm.eval(self.input_ids[text_start_pos:-1])
                     else:
                         self.set_sampler(for_trans=True)
-                    self.generated_audio_tokens_at_last_trans = self.generated_audio_tokens
                     self.external_response_queue.clear()
                     self.can_force_trans = False
                 # if the previous token was end_audio_token and next token *is* the agent speaker token, prepare to generate agent utterance text.
@@ -238,7 +244,8 @@ class RealtimeAgent:
     def whisper_trans(self) -> Optional[List[int]]:
         if self.resources.whisper_model is None:
             raise ValueError("Whisper model is not loaded.")
-        trans_audio_start_secs = self.generated_audio_tokens_at_last_trans / self.resources.audio_tokenizer.framerate
+        last_trans = self.last_transcription
+        trans_audio_start_secs = last_trans["time_secs"] if last_trans else 0.0
         trans_audio_start_samples = int(trans_audio_start_secs * self.resources.audio_tokenizer.sampling_rate)
         trans_audio = self.audio_history_ch2[trans_audio_start_samples:]
         segments = self.resources.whisper_model.transcribe(
@@ -371,7 +378,6 @@ class RealtimeAgent:
         transcript_entries = []
         for speaker, sp_text in self.transcript_regex.findall(text_str):
             sp_text = sp_text.lstrip()
-            time_secs = self.generated_audio_tokens / self.resources.audio_tokenizer.framerate
             # If the speaker is not the agent, the text is a transcription in audio-first interleave mode and
             # we need to subtract the utterance length from time_secs.
             if speaker != self.config.agent_identity:
@@ -379,18 +385,28 @@ class RealtimeAgent:
             transcript_entries.append({
                 "speaker": speaker,
                 "text": sp_text,
-                "time_secs": time_secs,
+                "time_secs": self.total_secs,
+                "text_start_pos": text_start_pos, # TODO: this is not accurate if there are multiple utterances
             })
         self.transcript.extend(
             sorted(transcript_entries, key=lambda x: x["time_secs"])
         )
 
-    def get_sequence_str(self, full: bool = False) -> str:
-        if full:
-            input_ids = self.input_ids_history + self.input_ids[self.trim_pos:]
-        else:
-            input_ids = self.input_ids
-        agent_sequence = self.resources.tokenizer.decode(input_ids, skip_special_tokens=False)
+    def frames_from_secs(self, secs: float) -> int:
+        frames = int(secs * self.resources.audio_tokenizer.framerate * 2)
+        # make sure we return the position at the beginning of an audio token pair
+        if frames % 2 != 0:
+            frames -= 1
+        return frames
+
+    def get_audio_tokens(self, start_secs: Optional[float] = None, end_secs: Optional[float] = None) -> List[int]:
+        start_frame = 0 if start_secs is None else self.frames_from_secs(start_secs)
+        end_frame = len(self.audio_tokens_idx) if end_secs is None else self.frames_from_secs(end_secs)
+        audio_tokens = [self.input_ids[i] for i in self.audio_tokens_idx[start_frame:end_frame]]
+        return audio_tokens
+
+    def get_sequence_str(self) -> str:
+        agent_sequence = self.resources.tokenizer.decode(self.input_ids, skip_special_tokens=False)
         return agent_sequence
     
     def get_audio_history(self) -> np.ndarray:
@@ -408,6 +424,7 @@ class RealtimeAgentMultiprocessingInfo:
     config: RealtimeAgentConfig
     sampling_rate: int
     chunk_size_samples: int
+    total_secs: float
     transcript: str
     sequence: str
     audio_history: np.ndarray
@@ -479,8 +496,9 @@ class RealtimeAgentMultiprocessing:
                         config=agent.config,
                         sampling_rate=agent.resources.audio_tokenizer.sampling_rate,
                         chunk_size_samples=agent.chunk_size_samples,
+                        total_secs=agent.total_secs,
                         transcript=agent.format_transcript(),
-                        sequence=agent.get_sequence_str(full=True),
+                        sequence=agent.get_sequence_str(),
                         audio_history=agent.get_audio_history(),
                     )
                     self.info_queue.put(info)
