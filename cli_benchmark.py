@@ -6,7 +6,6 @@ import soundfile as sf
 from tqdm import trange
 
 from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources
-from realtime_codec_agent.realtime_agent_config import RealtimeAgentConfig
 from realtime_codec_agent.utils.audio_utils import pad_or_trim
 
 logger = logging.getLogger(__name__)
@@ -37,11 +36,6 @@ if __name__ == "__main__":
     agent = RealtimeAgent(
         resources=RealtimeAgentResources(
             llm_model_path=args.llm_model_path,
-        ),
-        config=RealtimeAgentConfig(
-            agent_opening_text="hello how are you?",
-            seed=42,
-            run_profilers=True,
         ),
     )
 
