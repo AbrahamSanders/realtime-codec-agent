@@ -109,7 +109,8 @@ class RealtimeAgent:
         self.ch1_inactivity_elapsed_secs = 0.0
         self.ch2_inactivity_elapsed_secs = 0.0
         self.can_force_trans = False
-        self.audio_history_ch1, self.audio_history_ch2 = np.zeros((2, 0), dtype=np.float32)
+        self.audio_history_ch1: List[np.ndarray] = [] 
+        self.audio_history_ch2: List[np.ndarray] = []
         self.audio_tokens_idx = []
         self.transcript = []
         if c.agent_opening_text:
@@ -247,7 +248,8 @@ class RealtimeAgent:
         last_trans = self.last_transcription
         trans_audio_start_secs = last_trans["time_secs"] if last_trans else 0.0
         trans_audio_start_samples = int(trans_audio_start_secs * self.resources.audio_tokenizer.sampling_rate)
-        trans_audio = self.audio_history_ch2[trans_audio_start_samples:]
+        trans_audio_start_chunks, rem_samples = divmod(trans_audio_start_samples, self.chunk_size_samples)
+        trans_audio = np.concatenate(self.audio_history_ch2[trans_audio_start_chunks:])[rem_samples:]
         segments = self.resources.whisper_model.transcribe(
             trans_audio, 
             temperature=self.config.trans_temperature,
@@ -306,8 +308,8 @@ class RealtimeAgent:
             self.ch2_inactivity_elapsed_secs += self.config.chunk_size_secs
         
         # channel 1 (output)
-        curr_out_chunk = self.audio_history_ch1[-self.chunk_size_samples:]
-        curr_out_chunk_abs_max = 0.0 if curr_out_chunk.size == 0 else np.abs(curr_out_chunk).max()
+        curr_out_chunk = self.audio_history_ch1[-1] if len(self.audio_history_ch1) > 0 else None
+        curr_out_chunk_abs_max = 0.0 if curr_out_chunk is None else np.abs(curr_out_chunk).max()
         if curr_out_chunk_abs_max >= self.config.activity_abs_max_threshold:
             self.ch1_inactivity_elapsed_secs = 0.0
         else:
@@ -326,8 +328,8 @@ class RealtimeAgent:
     def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
         with self.profilers.total_profiler:
             # Sanity check - input size
-            if audio_chunk.shape[-1] != self.chunk_size_samples:
-                raise ValueError(f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}")
+            assert audio_chunk.shape[-1] == self.chunk_size_samples, \
+                f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}"
 
             # Encode audio chunk to input ids
             with self.profilers.audio_tokenize_profiler:
@@ -350,19 +352,26 @@ class RealtimeAgent:
             out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
             if self.config.target_volume_rms > 0:
                 out_chunk = normalize_audio_rms(out_chunk, target_rms=self.config.target_volume_rms)
-            self.audio_history_ch1 = smooth_join(self.audio_history_ch1, out_chunk, *self.crossfade_ramps)
-            self.audio_history_ch2 = np.concatenate((self.audio_history_ch2, audio_chunk), axis=-1)
-
-            # Emit the output chunk from the audio history, shifted left by chunk_fade_secs.
-            # This is done because the smooth join (crossfade) modifies the tail of the previous chunk.
-            # So, we include the tail of the previous chunk in the output and exclude the tail of the current chunk.
-            out_chunk = self.audio_history_ch1[-self.chunk_size_samples-self.crossfade_ramps[0]:-self.crossfade_ramps[0]]
-            # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
-            out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples, pad_side="left")
+            if len(self.audio_history_ch1) > 0:
+                joined_ch1_chunks = smooth_join(self.audio_history_ch1[-1], out_chunk, *self.crossfade_ramps)
+                # sanity check - joined size
+                assert joined_ch1_chunks.shape[-1] == 2 * self.chunk_size_samples, \
+                    f"joined_ch1_chunks must have length {2 * self.chunk_size_samples}, but got {joined_ch1_chunks.shape[-1]}"
+                self.audio_history_ch1[-1] = joined_ch1_chunks[:self.chunk_size_samples]
+                self.audio_history_ch1.append(joined_ch1_chunks[self.chunk_size_samples:])
+                # Emit the output chunk from the audio history, shifted left by chunk_fade_secs.
+                # This is done because the smooth join (crossfade) modifies the tail of the previous chunk.
+                # So, we include the tail of the previous chunk in the output and exclude the tail of the current chunk.
+                out_chunk = joined_ch1_chunks[-self.chunk_size_samples-self.crossfade_ramps[0]:-self.crossfade_ramps[0]]
+            else:
+                self.audio_history_ch1.append(out_chunk)
+                # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
+                out_chunk = pad_or_trim(out_chunk[:-self.crossfade_ramps[0]], self.chunk_size_samples, pad_side="left")
+            self.audio_history_ch2.append(audio_chunk)
 
             # Sanity check - output size
-            if out_chunk.shape[-1] != self.chunk_size_samples:
-                raise ValueError(f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}")
+            assert out_chunk.shape[-1] == self.chunk_size_samples, \
+                f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}"
             return out_chunk
 
     def update_transcript(self, text_start_pos: int) -> None:
@@ -410,7 +419,13 @@ class RealtimeAgent:
         return agent_sequence
     
     def get_audio_history(self) -> np.ndarray:
-        audio_history = np.stack([self.audio_history_ch1, self.audio_history_ch2], axis=0)
+        audio_history = np.stack(
+            [
+                np.concatenate(self.audio_history_ch1), 
+                np.concatenate(self.audio_history_ch2),
+            ], 
+            axis=0,
+        )
         return audio_history
     
     def format_transcript(self) -> str:
