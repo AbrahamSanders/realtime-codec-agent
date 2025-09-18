@@ -3,6 +3,7 @@ import argparse
 import logging
 import librosa
 import soundfile as sf
+import os
 from tqdm import trange
 
 from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources
@@ -39,19 +40,18 @@ if __name__ == "__main__":
         ),
     )
 
+    # load the input audio
     input_audio, sr = librosa.load(args.input_audio_path, sr=agent.resources.audio_tokenizer.sampling_rate, mono=False)
     input_audio = input_audio[args.input_channel]
 
+    # run the agent on the input audio
     for start in trange(0, input_audio.shape[-1], agent.chunk_size_samples, desc="Running"):
         end = start + agent.chunk_size_samples
         chunk = input_audio[start:end]
         chunk = pad_or_trim(chunk, agent.chunk_size_samples)
         _ = agent.process_audio(chunk)
 
-    out_history = agent.get_audio_history()
-    transcript = agent.format_transcript()
-    sequence = agent.get_sequence_str()
-
+    # save the profiler plots
     fig = agent.profilers.build_plot(ylim=(0.5, 3.0))
     fig.savefig("realtime_factor_profile_scaled1.png")
     fig = agent.profilers.build_plot(ylim=(0.5, 15.0))
@@ -61,18 +61,23 @@ if __name__ == "__main__":
     fig = agent.profilers.build_plot(ylim=(None, None))
     fig.savefig("realtime_factor_profile_unscaled.png")
 
-    # save the audio
-    out_history = (out_history * 32767.0).astype(np.int16)
-    sf.write("output.wav", out_history.T, sr)
+    # save the audio and transcript
+    audio_history = agent.get_audio_history()
+    transcript = agent.format_transcript()
+    sequence = agent.get_sequence_str()
+    os.makedirs("recordings", exist_ok=True)
+    with open("recordings/output.txt", "w", encoding="utf-8") as f:
+        f.write("---------------------------------------------------------------------------------------\n")
+        f.write("-- Transcript:\n")
+        f.write("---------------------------------------------------------------------------------------\n")
+        f.write(transcript)
+        f.write("\n\n")
+        f.write("---------------------------------------------------------------------------------------\n")
+        f.write("-- Sequence:\n")
+        f.write("---------------------------------------------------------------------------------------\n")
+        f.write(sequence)
+        f.write("\n")
+    audio_history = (audio_history * 32767.0).astype(np.int16)
+    sf.write("recordings/output.wav", audio_history.T, sr)
 
-    # print the transcript and sequence
-    print("---------------------------------------------------------------------------------")
-    print("--- Transcript:")
-    print("---------------------------------------------------------------------------------")
-    print(transcript)
-    print()
-    print("---------------------------------------------------------------------------------")
-    print("--- Sequence:")
-    print("---------------------------------------------------------------------------------")
-    print(sequence)
-    print()
+    print("Done!")

@@ -4,6 +4,7 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 import argparse
+import os
 
 from realtime_codec_agent.realtime_agent_v2 import RealtimeAgentMultiprocessing
 
@@ -59,7 +60,8 @@ class AgentHandler(StreamHandler):
             print(">>> Not Started <<<")
             return
         agent_info = self.agent.get_info()
-        with open("output.txt", "w", encoding="utf-8") as f:
+        os.makedirs("recordings", exist_ok=True)
+        with open("recordings/output.txt", "w", encoding="utf-8") as f:
             f.write("---------------------------------------------------------------------------------------\n")
             f.write("-- Transcript:\n")
             f.write("---------------------------------------------------------------------------------------\n")
@@ -71,7 +73,7 @@ class AgentHandler(StreamHandler):
             f.write(agent_info.sequence)
             f.write("\n")
         audio_history = (agent_info.audio_history * 32767.0).astype(np.int16)
-        sf.write("output.wav", audio_history.T, self.output_sample_rate)
+        sf.write("recordings/output.wav", audio_history.T, self.output_sample_rate)
         
         self.started = False
         print(">>> Stopped <<<")
