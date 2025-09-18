@@ -33,6 +33,14 @@ class RealtimeAgentResources:
             verbose=False,
             flash_attn=True,
         )
+        self.aux_llm = LlamaForAlternatingCodeChannels(
+            model_path=llm_model_path,
+            n_ctx=8192,
+            n_gpu_layers=-1,
+            verbose=False,
+            flash_attn=True,
+            logits_all=True,
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(os.path.dirname(llm_model_path))
         self.audio_tokenizer = AudioTokenizer(codec_model=codec_model, device=codec_device)
         self.whisper_model = whisper_model
@@ -217,6 +225,7 @@ class RealtimeAgent:
                 # if the previous token was end_audio_token and next token *is* the agent speaker token, prepare to generate agent utterance text.
                 # if use_external_llm is True, call the external LLM now instead of generating the agent utterance text natively
                 elif self.input_ids[-2] == self.end_audio_token_id and next_token == self.agent_speaker_token_id:
+                    text_start_pos += self.finalize_last_response()
                     response_suppressed = False
                     if self.config.use_external_llm:
                         speaker_logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
@@ -401,6 +410,87 @@ class RealtimeAgent:
             sorted(transcript_entries, key=lambda x: x["time_secs"])
         )
 
+    def finalize_last_response(self) -> int:
+        last_response = self.last_response
+        if last_response is None:
+            return 0
+        if last_response.get("planned_text"):
+            return 0
+        last_response["planned_text"] = last_response["text"]
+        last_response_start_secs = last_response["time_secs"]
+        last_response_end_secs = min(self.total_secs - self.ch1_inactivity_elapsed_secs, last_response_start_secs + 10.0)
+        if last_response_end_secs <= last_response_start_secs:
+            # TODO: no response audio - response should be removed from transcript?
+            return 0
+        last_response_audio_input_ids = self.get_audio_tokens(last_response_start_secs, last_response_end_secs)
+        c = self.config
+        af_ctx_prompt = "".join([
+            c.header_audio_first_token,
+            c.header_speaker_token,
+            f" {c.agent_identity}",
+            c.header_speaker_token,
+            f" {c.user_identity}",
+            c.end_header_token,
+        ])
+        af_ctx_input_ids = self.resources.tokenizer.encode(af_ctx_prompt)
+        af_ctx_input_ids.extend(
+            last_response_audio_input_ids + 
+            [self.end_audio_token_id, self.agent_speaker_token_id] + 
+            self.resources.tokenizer.encode(":", add_special_tokens=False)
+        )
+        to_ctx_prompt = "".join([
+            c.header_text_only_token,
+            c.header_speaker_token,
+            f" {c.agent_identity}",
+            c.header_speaker_token,
+            f" {c.user_identity}",
+            c.end_header_token,
+            f" {c.agent_identity}:",
+        ])
+        to_ctx_input_ids = self.resources.tokenizer.encode(to_ctx_prompt)
+        txt_input_ids = self.resources.tokenizer.encode(" " + last_response["text"], add_special_tokens=False)
+
+        af_probs = np.exp(self.resources.aux_llm.get_logprobs(af_ctx_input_ids, txt_input_ids))
+        to_probs = np.exp(self.resources.aux_llm.get_logprobs(to_ctx_input_ids, txt_input_ids))
+        probs_ratio = af_probs / to_probs
+
+        tol = 2
+        counter = 0
+        for i, ratio in enumerate(probs_ratio):
+            if ratio >= 1.0:
+                counter = 0
+            else:
+                counter += 1
+            if counter > tol:
+                i -= counter
+                break
+        final_text_input_ids = txt_input_ids[:i+1]
+        if len(final_text_input_ids) == len(txt_input_ids):
+            return 0
+        elif len(final_text_input_ids) == 0:
+            final_text_input_ids = self.resources.tokenizer.encode(" [silence]", add_special_tokens=False)
+        # else:
+        #     final_text_input_ids.append(self.resources.tokenizer.encode("-", add_special_tokens=False)[0])
+        last_response["text"] = self.resources.tokenizer.decode(final_text_input_ids, skip_special_tokens=False).lstrip()
+        # update sequence
+        text_start_pos = last_response["text_start_pos"]
+        txt_end_pos = text_start_pos + len(txt_input_ids)+2
+        prev_input_ids_len = len(self.input_ids)
+        trim_to_frames = self.frames_from_secs(self.trim_to_secs)
+        trim_to_pos = self.audio_tokens_idx[trim_to_frames]
+        self.input_ids = self.input_ids[:text_start_pos+2] + final_text_input_ids + self.input_ids[txt_end_pos:]
+        if trim_to_frames == 0 or text_start_pos >= trim_to_pos:
+            self.resources.llm.n_tokens = text_start_pos+2 if trim_to_frames == 0 else text_start_pos+2-trim_to_pos+self.context_start_pos
+            self.resources.llm.eval(self.input_ids[text_start_pos+2:-1])
+        input_ids_diff = len(self.input_ids) - prev_input_ids_len
+        # update self.audio_tokens_idx
+        if input_ids_diff != 0:
+            for i in range(len(self.audio_tokens_idx)-1, -1, -1):
+                if self.audio_tokens_idx[i] <= txt_end_pos:
+                    break
+                self.audio_tokens_idx[i] += input_ids_diff
+        return input_ids_diff
+
     def frames_from_secs(self, secs: float) -> int:
         frames = int(secs * self.resources.audio_tokenizer.framerate * 2)
         # make sure we return the position at the beginning of an audio token pair
@@ -419,6 +509,8 @@ class RealtimeAgent:
         return agent_sequence
     
     def get_audio_history(self) -> np.ndarray:
+        if len(self.audio_history_ch1) == 0:
+            return np.zeros((2, 0), dtype=np.float32)
         audio_history = np.stack(
             [
                 np.concatenate(self.audio_history_ch1), 
@@ -429,9 +521,16 @@ class RealtimeAgent:
         return audio_history
     
     def format_transcript(self) -> str:
-        formatted_transcript = "\n".join([
-            f"[{timedelta(seconds=int(entry['time_secs']))}] {entry['speaker']}: {entry['text']}" for entry in self.transcript
-        ])
+        formatted_lines = []
+        for entry in self.transcript:
+            if "planned_text" in entry and entry["text"] != entry["planned_text"]:
+                planned_text = entry["planned_text"] \
+                    if entry["text"] == "[silence]" else entry["planned_text"][len(entry["text"]):].lstrip()
+                entry_text = f"{entry['text']}  ⟶  {{{planned_text}}}"
+            else:
+                entry_text = entry['text']
+            formatted_lines.append(f"[{timedelta(seconds=int(entry['time_secs']))}] {entry['speaker']}: {entry_text}")
+        formatted_transcript = "\n".join(formatted_lines)
         return formatted_transcript
 
 @dataclass

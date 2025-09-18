@@ -7,6 +7,15 @@ class LlamaForAlternatingCodeChannels(Llama):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def get_logprobs(self, ctx_input_ids, input_ids):
+        self.reset()
+        self.eval(ctx_input_ids)
+        self.eval(input_ids)
+        logits = self._scores[-len(input_ids)-1:-1]
+        logprobs = Llama.logits_to_logprobs(logits)
+        logprobs = logprobs[range(len(input_ids)), input_ids]
+        return logprobs
+
     def init_sampler_for_generate(
         self,
         top_k: int = 40,

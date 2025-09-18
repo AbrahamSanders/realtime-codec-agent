@@ -26,6 +26,8 @@ class RealtimeAgentConfig:
     force_response_after_inactivity_secs: float = 3.0
     activity_abs_max_threshold: float = 100 / 32768.0
     seed: Optional[int] = 42
+    header_audio_first_token: str = "<|audio_first|>"
+    header_text_only_token: str = "<|text_only|>"
     header_agent_token: str = "<|agent|>"
     header_agent_voice_token: str = "<|agent_voice|>"
     header_speaker_token: str = "<|speaker|>"
