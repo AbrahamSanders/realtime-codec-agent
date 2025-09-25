@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 from warnings import warn
 from datetime import timedelta, datetime
-from typing import Union, Optional, List, Dict, Any
+from typing import Union, Optional, List, Dict, Any, Tuple
 from transformers import AutoTokenizer
 from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 
@@ -57,6 +57,7 @@ class RealtimeAgent:
             resources = RealtimeAgentResources()
         self.resources = resources
 
+        self.tts_client = None
         if config is None:
             config = RealtimeAgentConfig()
         self.set_config(config)
@@ -94,7 +95,13 @@ class RealtimeAgent:
         voice_enrollment = np.zeros(self.resources.audio_tokenizer.sampling_rate * 3, dtype=np.float32) \
             if c.agent_voice_enrollment is None else c.agent_voice_enrollment
         enrollment_audio_str = self.resources.audio_tokenizer.chunked_tokenize_audio(voice_enrollment, c.chunk_size_secs)
-        
+        if c.use_external_tts:
+            self.tts_client.close_stream()
+            external_tts_prompt_text = c.external_tts_prompt_text.strip() if c.external_tts_prompt_text is not None else None
+            if c.use_whisper and c.agent_voice_enrollment is not None and not external_tts_prompt_text:
+                external_tts_prompt_text = self._whisper_trans(c.agent_voice_enrollment)
+            self.tts_client.set_voice_enrollment(c.agent_voice_enrollment, external_tts_prompt_text)
+
         agent_prompt = "".join([
             c.header_agent_token,
             c.header_speaker_token,
@@ -128,6 +135,8 @@ class RealtimeAgent:
                 "time_secs": 0.0,
                 "text_start_pos": self.context_start_pos,
             })
+            if c.use_external_tts:
+                self.tts_client.prep_stream(c.agent_opening_text)
 
         self.external_response_queue = deque()
         self.profilers.reset()
@@ -150,6 +159,16 @@ class RealtimeAgent:
             self.client = OpenAI(
                 api_key=self.config.external_llm_api_key, 
                 base_url=self.config.external_llm_base_url,
+            )
+
+        if self.tts_client is not None:
+            self.tts_client.close_stream()
+        self.tts_client = None
+        if self.config.use_external_tts:
+            from .external_tts_client import ExternalTTSClient
+            self.tts_client = ExternalTTSClient(
+                server_url=self.config.external_tts_server_url, 
+                chunk_size_secs=self.config.chunk_size_secs,
             )
 
         self.profilers = RealtimeAgentProfilerCollection(self.config)
@@ -178,7 +197,13 @@ class RealtimeAgent:
             last_n = 2 if audio_mode else 1
             self.resources.llm.eval(self.input_ids[trim_to_pos:-last_n])
 
-    def process_audio_input_ids(self, audio_chunk_input_ids: List[int], force_trans: bool, force_response: bool) -> List[int]:
+    def process_audio_input_ids(
+        self, 
+        audio_chunk_input_ids: List[int], 
+        force_trans: bool = False, 
+        force_response: bool = False, 
+        tts_chunk_input_ids: Optional[List[int]] = None,
+    ) -> List[int]:
         out_chunk_input_ids = [0] * len(audio_chunk_input_ids)
         for i in range(len(audio_chunk_input_ids)):
             # trim the sequences to the maximum length
@@ -201,6 +226,10 @@ class RealtimeAgent:
                 self.input_ids.append(next_token)
                 # if next token is an audio token, append the next input (user) audio token
                 if next_token > self.end_header_token_id:
+                    # If an external tts chunk is available, substitute the generated audio token for the corresponding tts token
+                    if tts_chunk_input_ids is not None:
+                        next_token = tts_chunk_input_ids[i]
+                        self.input_ids[-1] = next_token
                     self.input_ids.append(audio_chunk_input_ids[i])
                     self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
                     out_chunk_input_ids[i] = next_token
@@ -259,6 +288,16 @@ class RealtimeAgent:
         trans_audio_start_samples = int(trans_audio_start_secs * self.resources.audio_tokenizer.sampling_rate)
         trans_audio_start_chunks, rem_samples = divmod(trans_audio_start_samples, self.chunk_size_samples)
         trans_audio = np.concatenate(self.audio_history_ch2[trans_audio_start_chunks:])[rem_samples:]
+        transcription = self._whisper_trans(trans_audio)
+        transcription = transcription.lower().replace("[blank_audio]", "").replace("...", "").replace(",", "").replace(".", "").replace(">>", "").strip()
+        if not transcription:
+            return None
+        transcription = f": {transcription}"
+        trans_input_ids = self.resources.tokenizer.encode(transcription, add_special_tokens=False)
+        return trans_input_ids
+    
+    def _whisper_trans(self, trans_audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
+        trans_audio = self.resources.audio_tokenizer._prep_audio_for_tokenization(trans_audio)
         segments = self.resources.whisper_model.transcribe(
             trans_audio, 
             temperature=self.config.trans_temperature,
@@ -268,12 +307,7 @@ class RealtimeAgent:
             print_progress=False,
         )
         transcription = " ".join([segment.text for segment in segments])
-        transcription = transcription.lower().replace("[blank_audio]", "").replace("...", "").replace(",", "").replace(".", "").replace(">>", "").strip()
-        if not transcription:
-            return None
-        transcription = f": {transcription}"
-        trans_input_ids = self.resources.tokenizer.encode(transcription, add_special_tokens=False)
-        return trans_input_ids
+        return transcription
 
     def call_external_llm(self) -> Optional[List[int]]:
         if len(self.external_response_queue) == 0:
@@ -339,19 +373,27 @@ class RealtimeAgent:
             # Sanity check - input size
             assert audio_chunk.shape[-1] == self.chunk_size_samples, \
                 f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}"
+            tts_chunk_input_ids = None
 
             # Encode audio chunk to input ids
             with self.profilers.audio_tokenize_profiler:
                 audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)
             with self.profilers.tokenize_profiler:
                 audio_chunk_input_ids = self.resources.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
+                if self.config.use_external_tts:
+                    tts_chunk = self.tts_client.next_chunk()
+                    if tts_chunk is not None:
+                        tts_chunk_input_ids = self.resources.tokenizer.encode(tts_chunk, add_special_tokens=False)
+                        # Sanity check - TTS chunk size
+                        assert len(tts_chunk_input_ids) == len(audio_chunk_input_ids), \
+                            f"TTS chunk must have {len(audio_chunk_input_ids)} tokens, but got {len(tts_chunk_input_ids)}"
             
             # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
             with self.profilers.lm_profiler:
                 self.update_inactivity_timers(audio_chunk)
                 force_trans = self.should_force_transcription()
                 force_response = self.should_force_response()
-                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans, force_response)
+                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans, force_response, tts_chunk_input_ids)
 
             # Decode input ids to audio chunk and append to the audio history
             with self.profilers.detokenize_profiler:
@@ -400,6 +442,8 @@ class RealtimeAgent:
             # we need to subtract the utterance length from time_secs.
             if speaker != self.config.agent_identity:
                 pass
+            elif self.config.use_external_tts:
+                self.tts_client.prep_stream(sp_text)
             transcript_entries.append({
                 "speaker": speaker,
                 "text": sp_text,

@@ -14,6 +14,6 @@ soundfile
 fastrtc
 torch
 tqdm
-websockets
-msgpack
 jsonlines
+flask
+voxcpm

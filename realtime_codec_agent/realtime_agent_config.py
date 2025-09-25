@@ -41,6 +41,9 @@ class RealtimeAgentConfig:
     external_llm_top_p: float = 0.9
     external_llm_instructions: Optional[str] = None
     external_llm_suppress_threshold: float = 0.1
+    use_external_tts: bool = False
+    external_tts_server_url: str = "http://127.0.0.1:8001"
+    external_tts_prompt_text: Optional[str] = None
     run_profilers: bool = True
     profiler_report_interval_secs: float = 2.0
 

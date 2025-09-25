@@ -34,6 +34,8 @@ def set_config_and_reset(
     force_response_after_inactivity_secs: float,
     use_external_llm: bool,
     external_llm_instructions: str,
+    use_external_tts: bool,
+    external_tts_prompt_text: str,
     run_profilers: bool,
 ):
     config = agent.config
@@ -57,6 +59,8 @@ def set_config_and_reset(
     config.force_response_after_inactivity_secs = float(force_response_after_inactivity_secs)
     config.use_external_llm = bool(use_external_llm)
     config.external_llm_instructions = external_llm_instructions
+    config.use_external_tts = bool(use_external_tts)
+    config.external_tts_prompt_text = external_tts_prompt_text
     config.run_profilers = bool(run_profilers)
 
     if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
@@ -151,6 +155,8 @@ if __name__ == "__main__":
             gr.Slider(0.0, 10.0, value=config.force_response_after_inactivity_secs, step=0.1, label="Force Response After Inactivity (seconds, 0 to disable)"),
             gr.Checkbox(config.use_external_llm, label=f"Use External LLM ({config.external_llm_model})"),
             gr.TextArea(config.external_llm_instructions, label="External LLM Instructions"),
+            gr.Checkbox(config.use_external_tts, label="Use External TTS (VoxCPM) for Speech Generation"),
+            gr.Textbox(config.external_tts_prompt_text, label="External TTS Voice Enrollment Prompt Text"),
             gr.Checkbox(config.run_profilers, label="Run Profilers"),
         ], 
         outputs=[

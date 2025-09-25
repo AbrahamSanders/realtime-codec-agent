@@ -111,7 +111,9 @@ class AgentHandler(StreamHandler):
             config.force_response_after_inactivity_secs = float(self.latest_args[18])
             config.use_external_llm = bool(self.latest_args[19])
             config.external_llm_instructions = self.latest_args[20]
-            config.run_profilers = bool(self.latest_args[21])
+            config.use_external_tts = bool(self.latest_args[21])
+            config.external_tts_prompt_text = self.latest_args[22]
+            config.run_profilers = bool(self.latest_args[23])
 
             if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                 config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
@@ -169,6 +171,8 @@ def main(args):
             gr.Slider(0.0, 10.0, value=config.force_response_after_inactivity_secs, step=0.1, label="Force Response After Inactivity (seconds, 0 to disable)"),
             gr.Checkbox(config.use_external_llm, label=f"Use External LLM ({config.external_llm_model})"),
             gr.TextArea(config.external_llm_instructions, label="External LLM Instructions"),
+            gr.Checkbox(config.use_external_tts, label="Use External TTS (VoxCPM) for Speech Generation"),
+            gr.Textbox(config.external_tts_prompt_text, label="External TTS Voice Enrollment Prompt Text"),
             gr.Checkbox(config.run_profilers, label="Run Profilers"),
         ],
         additional_outputs=[

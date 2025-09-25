@@ -66,17 +66,7 @@ class AudioTokenizer:
 
     @torch.inference_mode()
     def tokenize_audio(self, audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
-        if isinstance(audio, np.ndarray):
-            orig_sr = self.sampling_rate
-        else:
-            orig_sr, audio = audio
-        if audio.dtype == np.int16:
-            audio = audio.astype("float32") / 32768.0
-        if self.num_channels == 1 and audio.ndim > 1:
-            audio = librosa.to_mono(audio)
-        # resample to codec sample rate if needed
-        if orig_sr != self.sampling_rate:
-            audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=self.sampling_rate)
+        audio = self._prep_audio_for_tokenization(audio)
             
         # append audio to the context
         self.tokenize_context = np.concatenate((self.tokenize_context, audio.reshape(self.num_channels, -1)), axis=-1)
@@ -203,3 +193,17 @@ class AudioTokenizer:
         z_q = torch.nn.functional.embedding(codes, codebook)
         recon = self.codec_model.decoder(z_q).float()
         return recon
+    
+    def _prep_audio_for_tokenization(self, audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> np.ndarray:
+        if isinstance(audio, np.ndarray):
+            orig_sr = self.sampling_rate
+        else:
+            orig_sr, audio = audio
+        if audio.dtype == np.int16:
+            audio = audio.astype("float32") / 32768.0
+        if self.num_channels == 1 and audio.ndim > 1:
+            audio = librosa.to_mono(audio)
+        # resample to codec sample rate if needed
+        if orig_sr != self.sampling_rate:
+            audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=self.sampling_rate)
+        return audio
