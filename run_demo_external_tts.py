@@ -26,8 +26,10 @@ def tts_pipeline(enrollment_audio_numpy, enrollment_prompt_text: str, target_tex
                 audio_chunks[-1] = joined_chunk[:chunk_len]
                 chunk = joined_chunk[chunk_len:]
             audio_chunks.append(chunk)
-    audio_chunks = np.concatenate(audio_chunks, axis=-1)
-    return audio_tokenizer.sampling_rate, audio_chunks
+    if len(audio_chunks) == 0:
+        return None
+    audio = np.concatenate(audio_chunks, axis=-1)
+    return audio_tokenizer.sampling_rate, audio
 
 demo = gr.Interface(
     fn=tts_pipeline,

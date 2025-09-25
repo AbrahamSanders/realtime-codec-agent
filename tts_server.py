@@ -16,6 +16,18 @@ audio_tokenizer: AudioTokenizer = None
 text_normalizer: TextNormalizer = None
 
 session_prompt_caches = {}
+pause_regex = re.compile(r"\(\d*?\.\d*?\)")
+
+def _sanitize_text_for_tts(text):
+    text = re.sub(pause_regex, "...", text)
+    text = re.sub(r"(?:\s|\A)i?[hx]+[.,?!]*(?=(?:\s|\Z))", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"0 ?(?=\[)", "", text)
+    text = re.sub("0[.]", "", text)
+    text = re.sub(r"\[.*?\]", "", text)
+    text = re.sub(r"&=.*?(?=(?:\s|\Z))", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip()
+    return text
 
 @stream_with_context
 def generate_chunks(sid: str, text: str, chunk_size_secs: float) -> Iterable[str]:
@@ -28,7 +40,9 @@ def generate_chunks(sid: str, text: str, chunk_size_secs: float) -> Iterable[str
         session_prompt_caches[sid] = sid_prompt_cache
     fixed_prompt_cache, dynamic_prompt_cache = sid_prompt_cache["fixed_prompt_cache"], sid_prompt_cache["dynamic_prompt_cache"]
 
-    text = re.sub(r"\s+", " ", text)
+    text = _sanitize_text_for_tts(text)
+    if not text:
+        return
     text = text_normalizer.normalize(text)
     stream = voxcpm_model.tts_model.generate_with_prompt_cache_streaming(
         target_text=text,
@@ -65,10 +79,6 @@ def stream_chunks() -> Response:
             status=400,
         )
     text = data.get("text", "")
-    if text:
-        text = text.strip()
-    if not text:
-        return Response("No text provided", status=400)
     chunk_size_secs = float(data.get("chunk_size_secs", 0.1))
     return Response(generate_chunks(sid, text, chunk_size_secs), mimetype="text/plain")
 
