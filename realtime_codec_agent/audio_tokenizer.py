@@ -168,15 +168,21 @@ class AudioTokenizer:
         return audio_str, end_hanging
     
     @torch.inference_mode()
-    def _compute_framerate(self) -> float:
-        audio = torch.zeros(10 * self.sampling_rate).to(self.device)
+    def _encode_silence(self, secs: float) -> torch.Tensor:
+        audio = torch.zeros(int(secs * self.sampling_rate)).to(self.device)
         with torch.autocast(
             device_type = "cuda",
             dtype = torch.bfloat16,
             enabled = self.autocast_bfloat16,
         ):
             audio_codes = self._magicodec_encode(audio.unsqueeze(0))
-        samples_per_frame = math.ceil(audio.shape[-1] / audio_codes.shape[-1])
+        return audio_codes
+
+    def _compute_framerate(self) -> float:
+        test_secs = 10.0
+        audio_codes = self._encode_silence(test_secs)
+        samples = int(test_secs * self.sampling_rate)
+        samples_per_frame = math.ceil(samples / audio_codes.shape[-1])
         framerate = self.sampling_rate / samples_per_frame
         return framerate
 

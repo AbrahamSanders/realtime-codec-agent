@@ -26,6 +26,7 @@ class RealtimeAgentResources:
         codec_device: Optional[Union[str, torch.device]] = None,
         whisper_model: Optional[str] = "small.en",
     ):
+        self.llm_model_dir = os.path.dirname(llm_model_path)
         self.llm = LlamaForAlternatingCodeChannels(
             model_path=llm_model_path,
             n_ctx=131072,
@@ -41,7 +42,7 @@ class RealtimeAgentResources:
             flash_attn=True,
             logits_all=True,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(os.path.dirname(llm_model_path))
+        self.tokenizer = AutoTokenizer.from_pretrained(self.llm_model_dir)
         self.audio_tokenizer = AudioTokenizer(codec_model=codec_model, device=codec_device)
         self.whisper_model = whisper_model
         if self.whisper_model is not None:
@@ -166,10 +167,12 @@ class RealtimeAgent:
         self.tts_client = None
         if self.config.use_external_tts:
             from .external_tts_client import ExternalTTSClient
+            from .external_tts_duplex_aligner import ExternalTTSDuplexAligner
             self.tts_client = ExternalTTSClient(
                 server_url=self.config.external_tts_server_url, 
                 chunk_size_secs=self.config.chunk_size_secs,
             )
+            self.tts_duplex_aligner = ExternalTTSDuplexAligner(self.resources.audio_tokenizer, self.resources.llm_model_dir)
 
         self.profilers = RealtimeAgentProfilerCollection(self.config)
 
@@ -205,6 +208,7 @@ class RealtimeAgent:
         tts_chunk_input_ids: Optional[List[int]] = None,
     ) -> List[int]:
         out_chunk_input_ids = [0] * len(audio_chunk_input_ids)
+        tts_interrupt_scores = [0] * len(audio_chunk_input_ids)
         for i in range(len(audio_chunk_input_ids)):
             # trim the sequences to the maximum length
             self.trim_sequences()
@@ -228,6 +232,7 @@ class RealtimeAgent:
                 if next_token > self.end_header_token_id:
                     # If an external tts chunk is available, substitute the generated audio token for the corresponding tts token
                     if tts_chunk_input_ids is not None:
+                        tts_interrupt_scores[i] = self.tts_duplex_aligner.interrupt_score(tts_chunk_input_ids[i], next_token)
                         next_token = tts_chunk_input_ids[i]
                         self.input_ids[-1] = next_token
                     self.input_ids.append(audio_chunk_input_ids[i])
@@ -278,6 +283,10 @@ class RealtimeAgent:
                     self.update_transcript(text_start_pos)
                     self.set_sampler(for_trans=False)
                     
+        # Interrupt the external TTS stream if the duplex lm's agent response predictions are diverging toward silence
+        if tts_chunk_input_ids is not None and np.mean(tts_interrupt_scores) >= self.config.external_tts_interrupt_threshold:
+            self.tts_client.close_stream()
+
         return out_chunk_input_ids
 
     def whisper_trans(self) -> Optional[List[int]]:
