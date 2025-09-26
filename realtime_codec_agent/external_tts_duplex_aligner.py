@@ -1,3 +1,4 @@
+from typing import List
 from .audio_tokenizer import AudioTokenizer
 from transformers import AutoConfig
 import torch
@@ -13,14 +14,12 @@ class ExternalTTSDuplexAligner:
         silence_embeddings = torch.nn.functional.embedding(silence_codes, self.codec_embeddings)
         self.silence_embedding = silence_embeddings.mean(0)
 
-    def interrupt_score(self, tts_token_id: int, duplex_token_id: int) -> float:
-        tts_code = tts_token_id - self.codec_vocab_start
-        duplex_code = duplex_token_id - self.codec_vocab_start
-        tts_duplex_embs = torch.nn.functional.embedding(
-            torch.tensor([tts_code, duplex_code]).to(self.codec_embeddings.device), 
-            self.codec_embeddings,
-        )
-        dist_from_silence = torch.linalg.vector_norm(tts_duplex_embs-self.silence_embedding, dim=-1).tolist()
+    def interrupt_score(self, tts_token_ids: List[int], duplex_token_ids: List[int]) -> float:
+        tts_duplex_codes = torch.tensor([tts_token_ids, duplex_token_ids]).to(self.codec_embeddings.device)
+        tts_duplex_codes -= self.codec_vocab_start
+        tts_duplex_embs = torch.nn.functional.embedding(tts_duplex_codes, self.codec_embeddings)
+        dist_from_silence = torch.linalg.vector_norm(tts_duplex_embs-self.silence_embedding, dim=-1)
+        dist_from_silence = dist_from_silence.mean(dim=-1).tolist()
         tts_dist, duplex_dist = dist_from_silence
         # score is the ratio of the distances from silence.
         # interpret as: the tts prediction is {score} times further from silence than the duplex prediction.

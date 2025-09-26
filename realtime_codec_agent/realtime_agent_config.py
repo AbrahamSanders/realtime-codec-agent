@@ -44,7 +44,8 @@ class RealtimeAgentConfig:
     use_external_tts: bool = False
     external_tts_server_url: str = "http://127.0.0.1:8001"
     external_tts_prompt_text: Optional[str] = None
-    external_tts_interrupt_threshold: float = 1.2
+    external_tts_interrupt_threshold: float = 10000.0
+    external_tts_allow_fallback: bool = False
     run_profilers: bool = True
     profiler_report_interval_secs: float = 2.0
 

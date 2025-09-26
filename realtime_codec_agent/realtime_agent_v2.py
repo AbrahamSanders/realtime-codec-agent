@@ -69,8 +69,12 @@ class RealtimeAgent:
         self.reset()
 
     @property
+    def total_frames(self) -> int:
+        return len(self.audio_tokens_idx)
+
+    @property
     def total_secs(self) -> float:
-        return len(self.audio_tokens_idx) / (self.resources.audio_tokenizer.framerate * 2)
+        return self.total_frames / (self.resources.audio_tokenizer.framerate * 2)
 
     @property
     def last_transcription(self) -> Optional[Dict[str, Any]]:
@@ -173,6 +177,11 @@ class RealtimeAgent:
                 chunk_size_secs=self.config.chunk_size_secs,
             )
             self.tts_duplex_aligner = ExternalTTSDuplexAligner(self.resources.audio_tokenizer, self.resources.llm_model_dir)
+            if not self.config.external_tts_allow_fallback:
+                self.resources.audio_tokenizer.reset_context()
+                silence = np.zeros(self.resources.audio_tokenizer.context_samples, dtype=np.float32)
+                chunk_frames = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.framerate)
+                self.default_tts_fallback_chunk = self.resources.audio_tokenizer.tokenize_audio(silence)[-chunk_frames:]
 
         self.profilers = RealtimeAgentProfilerCollection(self.config)
 
@@ -192,23 +201,15 @@ class RealtimeAgent:
     def trim_sequences(self) -> None:
         if self.total_secs - self.trim_to_secs >= self.config.max_context_secs:
             self.trim_to_secs += self.config.trim_by_secs
-            trim_to_frames = self.frames_from_secs(self.trim_to_secs)
-            trim_to_pos = self.audio_tokens_idx[trim_to_frames]
-            # recompute the kv cache
-            self.resources.llm.n_tokens = self.context_start_pos
-            audio_mode = all([t > self.end_header_token_id for t in self.input_ids[-2:]])
-            last_n = 2 if audio_mode else 1
-            self.resources.llm.eval(self.input_ids[trim_to_pos:-last_n])
+            self.recompute_kv_cache(0)
 
     def process_audio_input_ids(
         self, 
         audio_chunk_input_ids: List[int], 
         force_trans: bool = False, 
         force_response: bool = False, 
-        tts_chunk_input_ids: Optional[List[int]] = None,
     ) -> List[int]:
         out_chunk_input_ids = [0] * len(audio_chunk_input_ids)
-        tts_interrupt_scores = [0] * len(audio_chunk_input_ids)
         for i in range(len(audio_chunk_input_ids)):
             # trim the sequences to the maximum length
             self.trim_sequences()
@@ -230,11 +231,6 @@ class RealtimeAgent:
                 self.input_ids.append(next_token)
                 # if next token is an audio token, append the next input (user) audio token
                 if next_token > self.end_header_token_id:
-                    # If an external tts chunk is available, substitute the generated audio token for the corresponding tts token
-                    if tts_chunk_input_ids is not None:
-                        tts_interrupt_scores[i] = self.tts_duplex_aligner.interrupt_score(tts_chunk_input_ids[i], next_token)
-                        next_token = tts_chunk_input_ids[i]
-                        self.input_ids[-1] = next_token
                     self.input_ids.append(audio_chunk_input_ids[i])
                     self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
                     out_chunk_input_ids[i] = next_token
@@ -283,11 +279,25 @@ class RealtimeAgent:
                     self.update_transcript(text_start_pos)
                     self.set_sampler(for_trans=False)
                     
-        # Interrupt the external TTS stream if the duplex lm's agent response predictions are diverging toward silence
-        if tts_chunk_input_ids is not None and np.mean(tts_interrupt_scores) >= self.config.external_tts_interrupt_threshold:
-            self.tts_client.close_stream()
-
         return out_chunk_input_ids
+    
+    def process_tts_input_ids(
+        self, 
+        tts_chunk_input_ids: List[int], 
+        out_chunk_input_ids: List[int], 
+    ) -> List[int]:
+        if tts_chunk_input_ids is None:
+            return out_chunk_input_ids
+        # interrupt the external tts stream if the duplex lm's agent response predictions are diverging toward silence
+        tts_interrupt_score = self.tts_duplex_aligner.interrupt_score(tts_chunk_input_ids, out_chunk_input_ids)
+        #print(f"TTS interrupt score: {tts_interrupt_score}")
+        if tts_interrupt_score >= self.config.external_tts_interrupt_threshold:
+            self.tts_client.close_stream()
+            return out_chunk_input_ids
+        # substitute the generated audio tokens for the corresponding tts tokens
+        start_frame = self.total_frames - len(out_chunk_input_ids) * 2
+        self.set_audio_tokens(tts_chunk_input_ids, start_frame=start_frame, channel=0)
+        return tts_chunk_input_ids
 
     def whisper_trans(self) -> Optional[List[int]]:
         if self.resources.whisper_model is None:
@@ -391,6 +401,8 @@ class RealtimeAgent:
                 audio_chunk_input_ids = self.resources.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
                 if self.config.use_external_tts:
                     tts_chunk = self.tts_client.next_chunk()
+                    if tts_chunk is None and not self.config.external_tts_allow_fallback:
+                        tts_chunk = self.default_tts_fallback_chunk
                     if tts_chunk is not None:
                         tts_chunk_input_ids = self.resources.tokenizer.encode(tts_chunk, add_special_tokens=False)
                         # Sanity check - TTS chunk size
@@ -402,7 +414,8 @@ class RealtimeAgent:
                 self.update_inactivity_timers(audio_chunk)
                 force_trans = self.should_force_transcription()
                 force_response = self.should_force_response()
-                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans, force_response, tts_chunk_input_ids)
+                out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans, force_response)
+                out_chunk_input_ids = self.process_tts_input_ids(tts_chunk_input_ids, out_chunk_input_ids)
 
             # Decode input ids to audio chunk and append to the audio history
             with self.profilers.detokenize_profiler:
@@ -526,20 +539,16 @@ class RealtimeAgent:
         #     final_text_input_ids.append(self.resources.tokenizer.encode("-", add_special_tokens=False)[0])
         last_response["text"] = self.resources.tokenizer.decode(final_text_input_ids, skip_special_tokens=False).lstrip()
         # update sequence
-        text_start_pos = last_response["text_start_pos"]
-        txt_end_pos = text_start_pos + len(txt_input_ids)+2
+        text_start_pos = last_response["text_start_pos"] + 2
+        text_end_pos = text_start_pos + len(txt_input_ids)
         prev_input_ids_len = len(self.input_ids)
-        trim_to_frames = self.frames_from_secs(self.trim_to_secs)
-        trim_to_pos = self.audio_tokens_idx[trim_to_frames]
-        self.input_ids = self.input_ids[:text_start_pos+2] + final_text_input_ids + self.input_ids[txt_end_pos:]
-        if trim_to_frames == 0 or text_start_pos >= trim_to_pos:
-            self.resources.llm.n_tokens = text_start_pos+2 if trim_to_frames == 0 else text_start_pos+2-trim_to_pos+self.context_start_pos
-            self.resources.llm.eval(self.input_ids[text_start_pos+2:-1])
+        self.input_ids = self.input_ids[:text_start_pos] + final_text_input_ids + self.input_ids[text_end_pos:]
+        self.recompute_kv_cache(text_start_pos, text_end_pos)
         input_ids_diff = len(self.input_ids) - prev_input_ids_len
         # update self.audio_tokens_idx
         if input_ids_diff != 0:
-            for i in range(len(self.audio_tokens_idx)-1, -1, -1):
-                if self.audio_tokens_idx[i] <= txt_end_pos:
+            for i in range(self.total_frames-1, -1, -1):
+                if self.audio_tokens_idx[i] <= text_end_pos:
                     break
                 self.audio_tokens_idx[i] += input_ids_diff
         return input_ids_diff
@@ -553,9 +562,37 @@ class RealtimeAgent:
 
     def get_audio_tokens(self, start_secs: Optional[float] = None, end_secs: Optional[float] = None) -> List[int]:
         start_frame = 0 if start_secs is None else self.frames_from_secs(start_secs)
-        end_frame = len(self.audio_tokens_idx) if end_secs is None else self.frames_from_secs(end_secs)
+        end_frame = self.total_frames if end_secs is None else self.frames_from_secs(end_secs)
         audio_tokens = [self.input_ids[i] for i in self.audio_tokens_idx[start_frame:end_frame]]
         return audio_tokens
+    
+    def set_audio_tokens(
+        self, 
+        audio_tokens: List[int], 
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None, 
+        channel: Optional[int] = None, 
+    ) -> None:
+        start_frame = 0 if start_frame is None else start_frame
+        end_frame = self.total_frames if end_frame is None else end_frame
+        audio_tokens_idx = self.audio_tokens_idx[start_frame:end_frame]
+        if channel is not None:
+            audio_tokens_idx = audio_tokens_idx[channel::2]
+        assert len(audio_tokens_idx) == len(audio_tokens), \
+            f"({len(audio_tokens)}) were provided, but ({len(audio_tokens_idx)}) exist in range [{start_frame}, {end_frame}) on channel {channel}."
+        for token_idx, new_token in zip(audio_tokens_idx, audio_tokens):
+            self.input_ids[token_idx] = new_token
+        self.recompute_kv_cache(audio_tokens_idx[0], audio_tokens_idx[-1]+1)
+        
+    def recompute_kv_cache(self, edit_start_pos: int, edit_end_pos: Optional[int] = None) -> None:
+        trim_to_frames = self.frames_from_secs(self.trim_to_secs)
+        trim_to_pos = self.audio_tokens_idx[trim_to_frames]
+        if trim_to_frames == 0 or edit_end_pos is None or edit_end_pos > trim_to_pos:
+            start_pos = edit_start_pos if trim_to_frames == 0 else max(edit_start_pos, trim_to_pos)
+            self.resources.llm.n_tokens = start_pos if trim_to_frames == 0 else start_pos-trim_to_pos+self.context_start_pos
+            audio_mode = all([t > self.end_header_token_id for t in self.input_ids[-2:]])
+            last_n = 2 if audio_mode else 1
+            self.resources.llm.eval(self.input_ids[start_pos:-last_n])
 
     def get_sequence_str(self) -> str:
         agent_sequence = self.resources.tokenizer.decode(self.input_ids, skip_special_tokens=False)

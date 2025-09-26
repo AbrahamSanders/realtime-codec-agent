@@ -46,7 +46,8 @@ def generate_chunks(sid: str, text: str, chunk_size_secs: float) -> Iterable[str
     text = text_normalizer.normalize(text)
     stream = voxcpm_model.tts_model.generate_with_prompt_cache_streaming(
         target_text=text,
-        prompt_cache=dynamic_prompt_cache if dynamic_prompt_cache is not None else fixed_prompt_cache,
+        prompt_cache=fixed_prompt_cache,#dynamic_prompt_cache if dynamic_prompt_cache is not None else fixed_prompt_cache,
+        inference_timesteps=5,
     )
     chunk_size_samples = int(chunk_size_secs * voxcpm_model.tts_model.sample_rate)
     buffer = np.zeros((0,), dtype=np.float32)
@@ -148,4 +149,4 @@ if __name__ == "__main__":
     text_normalizer = TextNormalizer()
 
     # Development server; use a production WSGI server (gunicorn, etc.) for prod.
-    app.run(host="0.0.0.0", port=8001, debug=False, threaded=False)
+    app.run(host="0.0.0.0", port=8001, debug=False, threaded=True)
