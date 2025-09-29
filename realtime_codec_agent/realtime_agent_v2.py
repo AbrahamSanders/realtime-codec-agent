@@ -4,7 +4,6 @@ import os
 import re
 import time
 from scipy.special import softmax
-from collections import deque
 from dataclasses import dataclass
 from warnings import warn
 from datetime import timedelta, datetime
@@ -16,7 +15,6 @@ from .audio_tokenizer import AudioTokenizer
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
 from .realtime_agent_config import RealtimeAgentConfig
 from .realtime_agent_profiler import RealtimeAgentProfilerCollection
-from .external_llm import get_external_llm_messages
 
 class RealtimeAgentResources:
     def __init__(
@@ -58,13 +56,13 @@ class RealtimeAgent:
             resources = RealtimeAgentResources()
         self.resources = resources
 
+        self.llm_client = None
         self.tts_client = None
         if config is None:
             config = RealtimeAgentConfig()
         self.set_config(config)
 
         self.transcript_regex = re.compile("([A-Z]):(.*?)(?= [A-Z]:|$)")
-        self.sentence_split_regex = re.compile("(?<=[.!?:]) ")
 
         self.reset()
 
@@ -96,12 +94,15 @@ class RealtimeAgent:
 
         self.set_sampler()
         self.resources.llm.reset()
+        if c.use_external_llm:
+            self.llm_client.close_stream()
+        if c.use_external_tts:
+            self.tts_client.close_stream()
         
         voice_enrollment = np.zeros(self.resources.audio_tokenizer.sampling_rate * 3, dtype=np.float32) \
             if c.agent_voice_enrollment is None else c.agent_voice_enrollment
         enrollment_audio_str = self.resources.audio_tokenizer.chunked_tokenize_audio(voice_enrollment, c.chunk_size_secs)
         if c.use_external_tts:
-            self.tts_client.close_stream()
             external_tts_prompt_text = c.external_tts_prompt_text.strip() if c.external_tts_prompt_text is not None else None
             if c.use_whisper and c.agent_voice_enrollment is not None and not external_tts_prompt_text:
                 external_tts_prompt_text = self._whisper_trans(c.agent_voice_enrollment)
@@ -143,7 +144,6 @@ class RealtimeAgent:
             if c.use_external_tts:
                 self.tts_client.prep_stream(c.agent_opening_text)
 
-        self.external_response_queue = deque()
         self.profilers.reset()
 
     def set_config(self, config: RealtimeAgentConfig):
@@ -158,12 +158,16 @@ class RealtimeAgent:
         self.agent_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.agent_identity}", add_special_tokens=False)[0]
         self.user_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.user_identity}", add_special_tokens=False)[0]
 
-        self.client = None
+        if self.llm_client is not None:
+            self.llm_client.close_stream()
+        self.llm_client = None
         if self.config.use_external_llm:
-            from openai import OpenAI
-            self.client = OpenAI(
+            from .external_llm_client import ExternalLLMClient
+            self.llm_client = ExternalLLMClient(
                 api_key=self.config.external_llm_api_key, 
                 base_url=self.config.external_llm_base_url,
+                model=self.config.external_llm_model,
+                agent_identity=self.config.agent_identity,
             )
 
         if self.tts_client is not None:
@@ -250,7 +254,8 @@ class RealtimeAgent:
                         self.resources.llm.eval(self.input_ids[text_start_pos:-1])
                     else:
                         self.set_sampler(for_trans=True)
-                    self.external_response_queue.clear()
+                    if self.config.use_external_llm:
+                        self.llm_client.close_stream()
                     self.can_force_trans = False
                 # if the previous token was end_audio_token and next token *is* the agent speaker token, prepare to generate agent utterance text.
                 # if use_external_llm is True, call the external LLM now instead of generating the agent utterance text natively
@@ -329,33 +334,21 @@ class RealtimeAgent:
         return transcription
 
     def call_external_llm(self) -> Optional[List[int]]:
-        if len(self.external_response_queue) == 0:
-            if self.client is None:
-                raise ValueError("External LLM client is not initialized.")
-            messages = get_external_llm_messages(
-                self.client.base_url.host, 
-                self.config.external_llm_instructions, 
-                self.transcript, 
-                self.config.agent_identity,
-            )
-            response = self.client.chat.completions.create(
-                model=self.config.external_llm_model,
-                messages=messages,
-                max_tokens=100,
+        if self.llm_client is None:
+            raise ValueError("External LLM client is not initialized.")
+        response_text = self.llm_client.next_sentence()
+        if response_text is None:
+            self.llm_client.prep_stream(
+                transcript=self.transcript,
+                additional_instructions=self.config.external_llm_instructions,
                 top_p=self.config.external_llm_top_p,
             )
-            response_text = response.choices[0].message.content
-            response_text = response_text.lower().replace("\n", " ").strip()
-            if response_text == "[silence]":
-                return None
-            # Split the response into sentences and enqueue them
-            sentences = self.sentence_split_regex.split(response_text)
-            sentences = [s.replace(",", "").replace(".", "").strip() for s in sentences]
-            sentences = [s for s in sentences if s]
-            if not sentences:
-                return None
-            self.external_response_queue.extend(sentences)
-        response_text = self.external_response_queue.popleft()
+            response_text = self.llm_client.next_sentence()
+        if response_text is None:
+            return None
+        response_text = response_text.lower().replace(",", "").replace(".", "")
+        if response_text == "[silence]":
+            return None
         response_text = f": {response_text}"
         response_input_ids = self.resources.tokenizer.encode(response_text, add_special_tokens=False)
         return response_input_ids
