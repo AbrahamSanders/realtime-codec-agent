@@ -95,7 +95,7 @@ class RealtimeAgent:
         self.set_sampler()
         self.resources.llm.reset()
         if c.use_external_llm:
-            self.llm_client.close_stream()
+            self.llm_client.close_stream(blocking=True)
         if c.use_external_tts:
             self.tts_client.close_stream()
         
@@ -159,7 +159,7 @@ class RealtimeAgent:
         self.user_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.user_identity}", add_special_tokens=False)[0]
 
         if self.llm_client is not None:
-            self.llm_client.close_stream()
+            self.llm_client.close_stream(blocking=True)
         self.llm_client = None
         if self.config.use_external_llm:
             from .external_llm_client import ExternalLLMClient
@@ -265,17 +265,18 @@ class RealtimeAgent:
                     if self.config.use_external_llm:
                         speaker_logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
                         user_prob = softmax(speaker_logits)[self.user_speaker_token_id]
-                        if user_prob < self.config.external_llm_suppress_threshold:
+                        response_suppressed = user_prob >= self.config.external_llm_suppress_threshold
+                        if not response_suppressed:
                             response_input_ids = self.call_external_llm()
-                            if response_input_ids is not None:
+                            response_suppressed = response_input_ids is None
+                            if not response_suppressed:
                                 self.input_ids.extend(response_input_ids + [self.start_audio_token_id])
                                 self.update_transcript(text_start_pos)
                                 self.resources.llm.eval(self.input_ids[text_start_pos:-1])
-                        else:
-                            self.input_ids = self.input_ids[:-2]
-                            self.resources.llm.n_tokens -= 3
-                            response_suppressed = True
-                    if not response_suppressed:
+                    if response_suppressed:
+                        self.input_ids = self.input_ids[:-2]
+                        self.resources.llm.n_tokens -= 3
+                    else:
                         # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
                         # this prevents duplicate responses when self.config.force_response_after_inactivity_secs > 0.0.
                         self.ch1_inactivity_elapsed_secs = 0.0
@@ -343,8 +344,8 @@ class RealtimeAgent:
                 additional_instructions=self.config.external_llm_instructions,
                 top_p=self.config.external_llm_top_p,
             )
-            response_text = self.llm_client.next_sentence()
-        if response_text is None:
+            return None
+        if response_text == self.llm_client.pending_status:
             return None
         response_text = response_text.lower().replace(",", "").replace(".", "")
         if response_text == "[silence]":
@@ -376,6 +377,8 @@ class RealtimeAgent:
         return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs
     
     def should_force_response(self) -> bool:
+        if self.config.use_external_llm and self.llm_client.stream_access_count == 0:
+            return True
         if self.config.force_response_after_inactivity_secs == 0.0:
             return False
         return min(self.ch1_inactivity_elapsed_secs, self.ch2_inactivity_elapsed_secs) >= self.config.force_response_after_inactivity_secs
