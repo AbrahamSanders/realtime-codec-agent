@@ -35,9 +35,6 @@ class RealtimeAgentConfig:
     start_audio_token: str = "<|audio|>"
     end_audio_token: str = "<|end_audio|>"
     use_external_llm: bool = False
-    external_llm_api_key: Optional[str] = None
-    external_llm_base_url: Optional[str] = None
-    external_llm_model: str = "gpt-4.1-nano"
     external_llm_top_p: float = 0.9
     external_llm_instructions: Optional[str] = None
     external_llm_suppress_threshold: float = 0.1

@@ -9,9 +9,9 @@ from warnings import warn
 from datetime import timedelta, datetime
 from typing import Union, Optional, List, Dict, Any, Tuple
 from transformers import AutoTokenizer
-from realtime_codec_agent.utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 
 from .audio_tokenizer import AudioTokenizer
+from .utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
 from .realtime_agent_config import RealtimeAgentConfig
 from .realtime_agent_profiler import RealtimeAgentProfilerCollection
@@ -23,11 +23,14 @@ class RealtimeAgentResources:
         codec_model: str = "MagiCodec-50Hz-Base", 
         codec_device: Optional[Union[str, torch.device]] = None,
         whisper_model: Optional[str] = "small.en",
+        external_llm_repo_id: Optional[str] = "ibm-granite/granite-4.0-h-micro-GGUF",
+        external_llm_filename: Optional[str] = "*Q4_K_M.gguf",
+        external_llm_tokenizer_repo_id: Optional[str] = "ibm-granite/granite-4.0-h-micro",
     ):
         self.llm_model_dir = os.path.dirname(llm_model_path)
         self.llm = LlamaForAlternatingCodeChannels(
             model_path=llm_model_path,
-            n_ctx=131072,
+            n_ctx=0,
             n_gpu_layers=-1,
             verbose=False,
             flash_attn=True,
@@ -46,6 +49,21 @@ class RealtimeAgentResources:
         if self.whisper_model is not None:
             from pywhispercpp.model import Model
             self.whisper_model = Model(self.whisper_model)
+        self.external_llm = None
+        if external_llm_repo_id is not None:
+            if external_llm_filename is None:
+                raise ValueError("external_llm_filename must be provided if external_llm_repo_id is provided.")
+            self.external_llm = LlamaForAlternatingCodeChannels.from_pretrained(
+                repo_id=external_llm_repo_id,
+                filename=external_llm_filename,
+                n_ctx=0,
+                n_gpu_layers=-1,
+                verbose=False,
+                flash_attn=True,
+            )
+            if external_llm_tokenizer_repo_id is None:
+                external_llm_tokenizer_repo_id = external_llm_repo_id
+            self.external_llm_tokenizer = AutoTokenizer.from_pretrained(external_llm_tokenizer_repo_id)
 
     def create_agent(self, config=None):
         return RealtimeAgent(resources=self, config=config)
@@ -56,7 +74,6 @@ class RealtimeAgent:
             resources = RealtimeAgentResources()
         self.resources = resources
 
-        self.llm_client = None
         self.tts_client = None
         if config is None:
             config = RealtimeAgentConfig()
@@ -95,7 +112,7 @@ class RealtimeAgent:
         self.set_sampler()
         self.resources.llm.reset()
         if c.use_external_llm:
-            self.llm_client.close_stream(blocking=True)
+            self.external_llm.reset()
         if c.use_external_tts:
             self.tts_client.close_stream()
         
@@ -140,6 +157,7 @@ class RealtimeAgent:
                 "text": c.agent_opening_text,
                 "time_secs": 0.0,
                 "text_start_pos": self.context_start_pos,
+                "external": False,
             })
             if c.use_external_tts:
                 self.tts_client.prep_stream(c.agent_opening_text)
@@ -158,16 +176,18 @@ class RealtimeAgent:
         self.agent_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.agent_identity}", add_special_tokens=False)[0]
         self.user_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.user_identity}", add_special_tokens=False)[0]
 
-        if self.llm_client is not None:
-            self.llm_client.close_stream(blocking=True)
-        self.llm_client = None
+        self.external_llm = None
         if self.config.use_external_llm:
-            from .external_llm_client import ExternalLLMClient
-            self.llm_client = ExternalLLMClient(
-                api_key=self.config.external_llm_api_key, 
-                base_url=self.config.external_llm_base_url,
-                model=self.config.external_llm_model,
-                agent_identity=self.config.agent_identity,
+            if self.resources.external_llm is None:
+                raise ValueError("External LLM model is not loaded.")
+            from .external_llm import ExternalLLMHandler
+            self.external_llm = ExternalLLMHandler(
+                llm=self.resources.external_llm,
+                tokenizer=self.resources.external_llm_tokenizer,
+                top_p=self.config.external_llm_top_p,
+                seed=self.config.seed,
+                additional_instructions=self.config.external_llm_instructions,
+                agent_opening_text=self.config.agent_opening_text,
             )
 
         if self.tts_client is not None:
@@ -200,7 +220,7 @@ class RealtimeAgent:
             presence_penalty=c.presence_penalty,
             frequency_penalty=c.frequency_penalty,
             seed=c.seed,
-        )        
+        )
 
     def trim_sequences(self) -> None:
         if self.total_secs - self.trim_to_secs >= self.config.max_context_secs:
@@ -250,12 +270,10 @@ class RealtimeAgent:
                         trans_input_ids = self.whisper_trans()
                     if trans_input_ids is not None:
                         self.input_ids.extend(trans_input_ids + [self.start_audio_token_id])
-                        self.update_transcript(text_start_pos)
+                        self.update_transcript(text_start_pos, external=True)
                         self.resources.llm.eval(self.input_ids[text_start_pos:-1])
                     else:
                         self.set_sampler(for_trans=True)
-                    if self.config.use_external_llm:
-                        self.llm_client.close_stream()
                     self.can_force_trans = False
                 # if the previous token was end_audio_token and next token *is* the agent speaker token, prepare to generate agent utterance text.
                 # if use_external_llm is True, call the external LLM now instead of generating the agent utterance text natively
@@ -267,11 +285,10 @@ class RealtimeAgent:
                         user_prob = softmax(speaker_logits)[self.user_speaker_token_id]
                         response_suppressed = user_prob >= self.config.external_llm_suppress_threshold
                         if not response_suppressed:
-                            response_input_ids = self.call_external_llm()
-                            response_suppressed = response_input_ids is None
-                            if not response_suppressed:
+                            response_input_ids, response_suppressed = self.call_external_llm()
+                            if response_input_ids is not None and not response_suppressed:
                                 self.input_ids.extend(response_input_ids + [self.start_audio_token_id])
-                                self.update_transcript(text_start_pos)
+                                self.update_transcript(text_start_pos, external=True)
                                 self.resources.llm.eval(self.input_ids[text_start_pos:-1])
                     if response_suppressed:
                         self.input_ids = self.input_ids[:-2]
@@ -283,7 +300,7 @@ class RealtimeAgent:
                 # if next token is start_audio_token, update the transcript and reset the sampler for audio generation
                 elif next_token == self.start_audio_token_id:
                     self.update_transcript(text_start_pos)
-                    self.set_sampler(for_trans=False)
+                    self.set_sampler()
                     
         return out_chunk_input_ids
     
@@ -334,25 +351,14 @@ class RealtimeAgent:
         transcription = " ".join([segment.text for segment in segments])
         return transcription
 
-    def call_external_llm(self) -> Optional[List[int]]:
-        if self.llm_client is None:
-            raise ValueError("External LLM client is not initialized.")
-        response_text = self.llm_client.next_sentence()
-        if response_text is None:
-            self.llm_client.prep_stream(
-                transcript=self.transcript,
-                additional_instructions=self.config.external_llm_instructions,
-                top_p=self.config.external_llm_top_p,
-            )
-            return None
-        if response_text == self.llm_client.pending_status:
-            return None
+    def call_external_llm(self) -> Tuple[Optional[List[int]], bool]:
+        response_text = self.external_llm.generate_response()
         response_text = response_text.lower().replace(",", "").replace(".", "")
-        if response_text == "[silence]":
-            return None
+        if response_text == "[silence]" or response_text == "[silent]":
+            return None, True
         response_text = f": {response_text}"
         response_input_ids = self.resources.tokenizer.encode(response_text, add_special_tokens=False)
-        return response_input_ids
+        return response_input_ids, False
 
     def update_inactivity_timers(self, audio_chunk: np.ndarray) -> None:
         # channel 2 (input)
@@ -377,8 +383,6 @@ class RealtimeAgent:
         return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs
     
     def should_force_response(self) -> bool:
-        if self.config.use_external_llm and self.llm_client.stream_access_count == 0:
-            return True
         if self.config.force_response_after_inactivity_secs == 0.0:
             return False
         return min(self.ch1_inactivity_elapsed_secs, self.ch2_inactivity_elapsed_secs) >= self.config.force_response_after_inactivity_secs
@@ -443,7 +447,7 @@ class RealtimeAgent:
                 f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}"
             return out_chunk
 
-    def update_transcript(self, text_start_pos: int) -> None:
+    def update_transcript(self, text_start_pos: int, external: bool = False) -> None:
         if text_start_pos is None:
             warn(
                 "No text start position found, skipping transcript update. "
@@ -456,10 +460,11 @@ class RealtimeAgent:
         transcript_entries = []
         for speaker, sp_text in self.transcript_regex.findall(text_str):
             sp_text = sp_text.lstrip()
-            # If the speaker is not the agent, the text is a transcription in audio-first interleave mode and
-            # we need to subtract the utterance length from time_secs.
             if speaker != self.config.agent_identity:
-                pass
+                if self.config.use_external_llm:
+                    self.external_llm.process_user_text(sp_text)
+                # TODO: If the speaker is not the agent, the text is a transcription in audio-first interleave mode and
+                # we need to subtract the utterance length from time_secs.
             elif self.config.use_external_tts:
                 self.tts_client.prep_stream(sp_text)
             transcript_entries.append({
@@ -467,6 +472,7 @@ class RealtimeAgent:
                 "text": sp_text,
                 "time_secs": self.total_secs,
                 "text_start_pos": text_start_pos, # TODO: this is not accurate if there are multiple utterances
+                "external": external,
             })
         self.transcript.extend(
             sorted(transcript_entries, key=lambda x: x["time_secs"])
@@ -615,6 +621,8 @@ class RealtimeAgent:
                 entry_text = f"{entry['text']}  ⟶  {{{planned_text}}}"
             else:
                 entry_text = entry['text']
+            if entry["external"]:
+                entry_text += " †"
             formatted_lines.append(f"[{timedelta(seconds=int(entry['time_secs']))}] {entry['speaker']}: {entry_text}")
         formatted_transcript = "\n".join(formatted_lines)
         return formatted_transcript
