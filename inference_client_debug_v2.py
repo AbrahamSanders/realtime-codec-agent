@@ -112,21 +112,6 @@ if __name__ == "__main__":
         default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
         help="Path to the model GGUF file.",
     )
-    parser.add_argument(
-        "--external_llm_repo_id",
-        default="ibm-granite/granite-4.0-h-micro-GGUF",
-        help="HuggingFace repo ID for the external LLM model to use (if any).",
-    )
-    parser.add_argument(
-        "--external_llm_filename",
-        default="*Q4_K_M.gguf",
-        help="Filename for the external LLM model to use (if any).",
-    )
-    parser.add_argument(
-        "--external_llm_tokenizer_repo_id",
-        default="ibm-granite/granite-4.0-h-micro",
-        help="HuggingFace repo ID for the external LLM tokenizer to use (if any).",
-    )
 
     args = parser.parse_args()
     print(f"Running with args: {args}")
@@ -135,9 +120,6 @@ if __name__ == "__main__":
     agent = RealtimeAgent(
         resources=RealtimeAgentResources(
             llm_model_path=args.llm_model_path,
-            external_llm_repo_id=args.external_llm_repo_id,
-            external_llm_filename=args.external_llm_filename,
-            external_llm_tokenizer_repo_id=args.external_llm_tokenizer_repo_id,
         ),
     )
 
@@ -171,7 +153,7 @@ if __name__ == "__main__":
             gr.Number(config.trim_by_secs, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
             gr.Slider(0.0, 0.1, value=config.target_volume_rms, step=0.01, label="Volume Normalization (0 to disable)"),
             gr.Slider(0.0, 10.0, value=config.force_response_after_inactivity_secs, step=0.1, label="Force Response After Inactivity (seconds, 0 to disable)"),
-            gr.Checkbox(config.use_external_llm, label=f"Use External LLM ({args.external_llm_repo_id})"),
+            gr.Checkbox(config.use_external_llm, label=f"Use External LLM ({config.external_llm_model})"),
             gr.TextArea(config.external_llm_instructions, label="External LLM Instructions"),
             gr.Checkbox(config.use_external_tts, label="Use External TTS (VoxCPM) for Speech Generation"),
             gr.Textbox(config.external_tts_prompt_text, label="External TTS Voice Enrollment Prompt Text"),
