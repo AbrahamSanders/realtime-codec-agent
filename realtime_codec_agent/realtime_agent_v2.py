@@ -638,6 +638,7 @@ class RealtimeAgentMultiprocessingInfo:
     transcript: str
     sequence: str
     audio_history: np.ndarray
+    external_llm_messages: Optional[List[Dict[str, str]]]
 
 class RealtimeAgentMultiprocessing:
     def __init__(
@@ -710,6 +711,7 @@ class RealtimeAgentMultiprocessing:
                         transcript=agent.format_transcript(),
                         sequence=agent.get_sequence_str(),
                         audio_history=agent.get_audio_history(),
+                        external_llm_messages=agent.external_llm.messages if agent.external_llm is not None else None,
                     )
                     self.info_queue.put(info)
                     self.get_info_flag.value = False

@@ -1,13 +1,14 @@
+from typing import Tuple
 import gradio as gr
 import numpy as np
 import argparse
 import logging
 import librosa
-from typing import Tuple
 import matplotlib.pyplot as plt
 
 from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources
 from realtime_codec_agent.utils.audio_utils import pad_or_trim
+from realtime_codec_agent.utils.cli_utils import add_common_inference_args
 
 logger = logging.getLogger(__name__)
 
@@ -101,33 +102,15 @@ def run_agent(
                 out_history = agent.get_audio_history()
                 transcript = agent.format_transcript()
                 sequence = agent.get_sequence_str()
-                yield realtime_plot, (sr, out_history.T), transcript, sequence
+                external_llm_messages = agent.external_llm.messages if agent.external_llm is not None else None
+                yield realtime_plot, (sr, out_history.T), transcript, sequence, external_llm_messages
             elif realtime_plot is not None:
-                yield realtime_plot, None, None, None
+                yield realtime_plot, None, None, None, None
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the Realtime Codec Agent debug interface.")
-    parser.add_argument(
-        "--llm_model_path", 
-        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
-        help="Path to the model GGUF file.",
-    )
-    parser.add_argument(
-        "--external_llm_repo_id",
-        default="ibm-granite/granite-4.0-h-micro-GGUF",
-        help="HuggingFace repo ID for the external LLM model to use (if any).",
-    )
-    parser.add_argument(
-        "--external_llm_filename",
-        default="*Q4_K_M.gguf",
-        help="Filename for the external LLM model to use (if any).",
-    )
-    parser.add_argument(
-        "--external_llm_tokenizer_repo_id",
-        default="ibm-granite/granite-4.0-h-micro",
-        help="HuggingFace repo ID for the external LLM tokenizer to use (if any).",
-    )
-
+    add_common_inference_args(parser)
+    
     args = parser.parse_args()
     print(f"Running with args: {args}")
     logging.basicConfig(level=logging.INFO)
@@ -182,6 +165,7 @@ if __name__ == "__main__":
             gr.Audio(label="Audio"),
             gr.TextArea(label="Transcript"),
             gr.TextArea(label="Sequence"),
+            gr.JSON(label="External LLM Messages"),
         ],
         allow_flagging='never'
     )

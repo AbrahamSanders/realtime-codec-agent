@@ -5,8 +5,10 @@ import numpy as np
 import soundfile as sf
 import argparse
 import os
+import json
 
 from realtime_codec_agent.realtime_agent_v2 import RealtimeAgentMultiprocessing
+from realtime_codec_agent.utils.cli_utils import add_common_inference_args
 
 class AgentHandler(StreamHandler):
     def __init__(self, agent: RealtimeAgentMultiprocessing):
@@ -71,7 +73,13 @@ class AgentHandler(StreamHandler):
             f.write("-- Sequence:\n")
             f.write("---------------------------------------------------------------------------------------\n")
             f.write(agent_info.sequence)
-            f.write("\n")
+            f.write("\n\n")
+            if agent_info.config.use_external_llm:
+                f.write("---------------------------------------------------------------------------------------\n")
+                f.write("-- External LLM Messages:\n")
+                f.write("---------------------------------------------------------------------------------------\n")
+                f.write(json.dumps(agent_info.external_llm_messages, indent=4))
+                f.write("\n\n")
         audio_history = (agent_info.audio_history * 32767.0).astype(np.int16)
         sf.write("recordings/output.wav", audio_history.T, self.output_sample_rate)
         
@@ -189,26 +197,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Realtime Codec Agent with FastRTC.")
-    parser.add_argument(
-        "--llm_model_path", 
-        default="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
-        help="Path to the model GGUF file.",
-    )
-    parser.add_argument(
-        "--external_llm_repo_id",
-        default="ibm-granite/granite-4.0-h-micro-GGUF",
-        help="HuggingFace repo ID for the external LLM model to use (if any).",
-    )
-    parser.add_argument(
-        "--external_llm_filename",
-        default="*Q4_K_M.gguf",
-        help="Filename for the external LLM model to use (if any).",
-    )
-    parser.add_argument(
-        "--external_llm_tokenizer_repo_id",
-        default="ibm-granite/granite-4.0-h-micro",
-        help="HuggingFace repo ID for the external LLM tokenizer to use (if any).",
-    )
+    add_common_inference_args(parser)
 
     args = parser.parse_args()
 
