@@ -20,24 +20,26 @@ class RealtimeAgentResources:
     def __init__(
         self, 
         llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
+        llm_n_ctx: int = 16384,
         codec_model: str = "MagiCodec-50Hz-Base", 
         codec_device: Optional[Union[str, torch.device]] = None,
         whisper_model: Optional[str] = "small.en",
         external_llm_repo_id: Optional[str] = "ibm-granite/granite-4.0-h-micro-GGUF",
         external_llm_filename: Optional[str] = "*Q4_K_M.gguf",
         external_llm_tokenizer_repo_id: Optional[str] = "ibm-granite/granite-4.0-h-micro",
+        external_llm_n_ctx: int = 131072,
     ):
         self.llm_model_dir = os.path.dirname(llm_model_path)
         self.llm = LlamaForAlternatingCodeChannels(
             model_path=llm_model_path,
-            n_ctx=0,
+            n_ctx=llm_n_ctx,
             n_gpu_layers=-1,
             verbose=False,
             flash_attn=True,
         )
         self.aux_llm = LlamaForAlternatingCodeChannels(
             model_path=llm_model_path,
-            n_ctx=8192,
+            n_ctx=llm_n_ctx,
             n_gpu_layers=-1,
             verbose=False,
             flash_attn=True,
@@ -56,7 +58,7 @@ class RealtimeAgentResources:
             self.external_llm = LlamaForAlternatingCodeChannels.from_pretrained(
                 repo_id=external_llm_repo_id,
                 filename=external_llm_filename,
-                n_ctx=0,
+                n_ctx=external_llm_n_ctx,
                 n_gpu_layers=-1,
                 verbose=False,
                 flash_attn=True,
