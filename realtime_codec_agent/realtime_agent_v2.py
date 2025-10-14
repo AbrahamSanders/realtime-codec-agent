@@ -1,6 +1,4 @@
 import numpy as np
-import torch
-import os
 import re
 import time
 from scipy.special import softmax
@@ -8,67 +6,11 @@ from dataclasses import dataclass
 from warnings import warn
 from datetime import timedelta, datetime
 from typing import Union, Optional, List, Dict, Any, Tuple
-from transformers import AutoTokenizer
 
-from .audio_tokenizer import AudioTokenizer
-from .utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
+from .realtime_agent_resources import RealtimeAgentResources
 from .realtime_agent_config import RealtimeAgentConfig
 from .realtime_agent_profiler import RealtimeAgentProfilerCollection
-
-class RealtimeAgentResources:
-    def __init__(
-        self, 
-        llm_model_path: str = "Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test/Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test-F16.gguf", 
-        llm_n_ctx: int = 16384,
-        codec_model: str = "MagiCodec-50Hz-Base", 
-        codec_device: Optional[Union[str, torch.device]] = None,
-        whisper_model: Optional[str] = "small.en",
-        external_llm_repo_id: Optional[str] = "ibm-granite/granite-4.0-h-micro-GGUF",
-        external_llm_filename: Optional[str] = "*Q4_K_M.gguf",
-        external_llm_tokenizer_repo_id: Optional[str] = "ibm-granite/granite-4.0-h-micro",
-        external_llm_n_ctx: int = 131072,
-    ):
-        self.llm_model_dir = os.path.dirname(llm_model_path)
-        self.llm = LlamaForAlternatingCodeChannels(
-            model_path=llm_model_path,
-            n_ctx=llm_n_ctx,
-            n_gpu_layers=-1,
-            verbose=False,
-            flash_attn=True,
-        )
-        self.aux_llm = LlamaForAlternatingCodeChannels(
-            model_path=llm_model_path,
-            n_ctx=llm_n_ctx,
-            n_gpu_layers=-1,
-            verbose=False,
-            flash_attn=True,
-            logits_all=True,
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.llm_model_dir)
-        self.audio_tokenizer = AudioTokenizer(codec_model=codec_model, device=codec_device)
-        self.whisper_model = whisper_model
-        if self.whisper_model is not None:
-            from pywhispercpp.model import Model
-            self.whisper_model = Model(self.whisper_model)
-        self.external_llm = None
-        if external_llm_repo_id is not None:
-            if external_llm_filename is None:
-                raise ValueError("external_llm_filename must be provided if external_llm_repo_id is provided.")
-            self.external_llm = LlamaForAlternatingCodeChannels.from_pretrained(
-                repo_id=external_llm_repo_id,
-                filename=external_llm_filename,
-                n_ctx=external_llm_n_ctx,
-                n_gpu_layers=-1,
-                verbose=False,
-                flash_attn=True,
-            )
-            if external_llm_tokenizer_repo_id is None:
-                external_llm_tokenizer_repo_id = external_llm_repo_id
-            self.external_llm_tokenizer = AutoTokenizer.from_pretrained(external_llm_tokenizer_repo_id)
-
-    def create_agent(self, config=None):
-        return RealtimeAgent(resources=self, config=config)
 
 class RealtimeAgent:
     def __init__(self, resources: RealtimeAgentResources = None, config: RealtimeAgentConfig = None):
@@ -183,14 +125,7 @@ class RealtimeAgent:
             if self.resources.external_llm is None:
                 raise ValueError("External LLM model is not loaded.")
             from .external_llm import ExternalLLMHandler
-            self.external_llm = ExternalLLMHandler(
-                llm=self.resources.external_llm,
-                tokenizer=self.resources.external_llm_tokenizer,
-                top_p=self.config.external_llm_top_p,
-                seed=self.config.seed,
-                additional_instructions=self.config.external_llm_instructions,
-                agent_opening_text=self.config.agent_opening_text,
-            )
+            self.external_llm = ExternalLLMHandler(self.resources, self.config)
 
         if self.tts_client is not None:
             self.tts_client.close_stream()
@@ -287,11 +222,11 @@ class RealtimeAgent:
                         user_prob = softmax(speaker_logits)[self.user_speaker_token_id]
                         response_suppressed = user_prob >= self.config.external_llm_suppress_threshold
                         if not response_suppressed:
-                            response_input_ids, response_suppressed = self.call_external_llm()
-                            if response_input_ids is not None and not response_suppressed:
-                                self.input_ids.extend(response_input_ids + [self.start_audio_token_id])
+                            response_input_ids = self.external_llm.generate_response()
+                            response_suppressed = response_input_ids is None
+                            if not response_suppressed:
+                                self.input_ids.extend(response_input_ids[1:] + [self.start_audio_token_id])
                                 self.update_transcript(text_start_pos, external=True)
-                                self.resources.llm.eval(self.input_ids[text_start_pos:-1])
                     if response_suppressed:
                         self.input_ids = self.input_ids[:-2]
                         self.resources.llm.n_tokens -= 3
@@ -352,15 +287,6 @@ class RealtimeAgent:
         )
         transcription = " ".join([segment.text for segment in segments])
         return transcription
-
-    def call_external_llm(self) -> Tuple[Optional[List[int]], bool]:
-        response_text = self.external_llm.generate_response()
-        response_text = response_text.lower().replace(",", "").replace(".", "")
-        if response_text == "[silence]" or response_text == "[silent]":
-            return None, True
-        response_text = f": {response_text}"
-        response_input_ids = self.resources.tokenizer.encode(response_text, add_special_tokens=False)
-        return response_input_ids, False
 
     def update_inactivity_timers(self, audio_chunk: np.ndarray) -> None:
         # channel 2 (input)

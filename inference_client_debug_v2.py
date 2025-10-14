@@ -6,9 +6,8 @@ import logging
 import librosa
 import matplotlib.pyplot as plt
 
-from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources
+from realtime_codec_agent import RealtimeAgent, RealtimeAgentResources, add_common_inference_args
 from realtime_codec_agent.utils.audio_utils import pad_or_trim
-from realtime_codec_agent.utils.cli_utils import add_common_inference_args
 
 logger = logging.getLogger(__name__)
 

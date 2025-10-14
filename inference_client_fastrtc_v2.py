@@ -7,8 +7,7 @@ import argparse
 import os
 import json
 
-from realtime_codec_agent.realtime_agent_v2 import RealtimeAgentMultiprocessing
-from realtime_codec_agent.utils.cli_utils import add_common_inference_args
+from realtime_codec_agent import RealtimeAgentMultiprocessing, add_common_inference_args
 
 class AgentHandler(StreamHandler):
     def __init__(self, agent: RealtimeAgentMultiprocessing):

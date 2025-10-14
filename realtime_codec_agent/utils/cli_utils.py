@@ -8,7 +8,7 @@ def add_common_inference_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--external_llm_repo_id",
-        default="ibm-granite/granite-4.0-h-micro-GGUF",
+        default="ibm-granite/granite-4.0-micro-GGUF",
         help="HuggingFace repo ID for the external LLM model to use (if any).",
     )
     parser.add_argument(
@@ -18,6 +18,6 @@ def add_common_inference_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--external_llm_tokenizer_repo_id",
-        default="ibm-granite/granite-4.0-h-micro",
+        default="ibm-granite/granite-4.0-micro",
         help="HuggingFace repo ID for the external LLM tokenizer to use (if any).",
     )

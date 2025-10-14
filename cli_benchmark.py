@@ -7,9 +7,8 @@ import os
 import json
 from tqdm import trange
 
-from realtime_codec_agent.realtime_agent_v2 import RealtimeAgent, RealtimeAgentResources, RealtimeAgentConfig
+from realtime_codec_agent import RealtimeAgent, RealtimeAgentResources, RealtimeAgentConfig, add_common_inference_args
 from realtime_codec_agent.utils.audio_utils import pad_or_trim
-from realtime_codec_agent.utils.cli_utils import add_common_inference_args
 
 logger = logging.getLogger(__name__)
 
