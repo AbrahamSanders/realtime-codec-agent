@@ -14,10 +14,6 @@ class RealtimeAgentResources:
         codec_model: str = "MagiCodec-50Hz-Base", 
         codec_device: Optional[Union[str, torch.device]] = None,
         whisper_model: Optional[str] = "small.en",
-        external_llm_repo_id: Optional[str] = "ibm-granite/granite-4.0-micro-GGUF",
-        external_llm_filename: Optional[str] = "*Q4_K_M.gguf",
-        external_llm_tokenizer_repo_id: Optional[str] = "ibm-granite/granite-4.0-micro",
-        external_llm_n_ctx: int = 0,
     ):
         self.llm_model_dir = os.path.dirname(llm_model_path)
         self.llm = LlamaForAlternatingCodeChannels(
@@ -41,18 +37,3 @@ class RealtimeAgentResources:
         if self.whisper_model is not None:
             from pywhispercpp.model import Model
             self.whisper_model = Model(self.whisper_model)
-        self.external_llm = None
-        if external_llm_repo_id is not None:
-            if external_llm_filename is None:
-                raise ValueError("external_llm_filename must be provided if external_llm_repo_id is provided.")
-            self.external_llm = LlamaForAlternatingCodeChannels.from_pretrained(
-                repo_id=external_llm_repo_id,
-                filename=external_llm_filename,
-                n_ctx=external_llm_n_ctx,
-                n_gpu_layers=-1,
-                verbose=False,
-                flash_attn=True,
-            )
-            if external_llm_tokenizer_repo_id is None:
-                external_llm_tokenizer_repo_id = external_llm_repo_id
-            self.external_llm_tokenizer = AutoTokenizer.from_pretrained(external_llm_tokenizer_repo_id)

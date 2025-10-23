@@ -34,15 +34,22 @@ class RealtimeAgentConfig:
     end_header_token: str = "<|end_header|>"
     start_audio_token: str = "<|audio|>"
     end_audio_token: str = "<|end_audio|>"
+    external_marker_token: str = "†"
     use_external_llm: bool = False
+    external_llm_api_key: Optional[str] = "empty"
+    external_llm_base_url: Optional[str] = "http://localhost:8080/v1"
+    external_llm_model: Optional[str] = None
     external_llm_top_p: float = 0.9
     external_llm_instructions: Optional[str] = None
     external_llm_suppress_threshold: float = 0.1
     use_external_tts: bool = False
-    external_tts_server_url: str = "http://127.0.0.1:8001"
+    external_tts_server_url: str = "http://localhost:8001"
     external_tts_prompt_text: Optional[str] = None
     external_tts_interrupt_threshold: float = 10000.0
     external_tts_allow_fallback: bool = False
+    constrain_allow_noise: bool = False
+    constrain_allow_breathing: bool = False
+    constrain_allow_laughter: bool = True
     run_profilers: bool = True
     profiler_report_interval_secs: float = 2.0
 

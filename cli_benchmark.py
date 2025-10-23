@@ -52,9 +52,6 @@ if __name__ == "__main__":
     agent = RealtimeAgent(
         resources=RealtimeAgentResources(
             llm_model_path=args.llm_model_path,
-            external_llm_repo_id=args.external_llm_repo_id if args.use_external_llm else None,
-            external_llm_filename=args.external_llm_filename if args.use_external_llm else None,
-            external_llm_tokenizer_repo_id=args.external_llm_tokenizer_repo_id if args.use_external_llm else None,
         ),
         config=RealtimeAgentConfig(
             use_external_llm=args.use_external_llm,

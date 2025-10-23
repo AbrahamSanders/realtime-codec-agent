@@ -5,7 +5,7 @@ from scipy.special import softmax
 from dataclasses import dataclass
 from warnings import warn
 from datetime import timedelta, datetime
-from typing import Union, Optional, List, Dict, Any, Tuple
+from typing import Union, Optional, List, Dict, Any, Tuple, Set
 
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
 from .realtime_agent_resources import RealtimeAgentResources
@@ -18,12 +18,20 @@ class RealtimeAgent:
             resources = RealtimeAgentResources()
         self.resources = resources
 
+        self.llm_client = None
         self.tts_client = None
         if config is None:
             config = RealtimeAgentConfig()
         self.set_config(config)
 
         self.transcript_regex = re.compile("([A-Z]):(.*?)(?= [A-Z]:|$)")
+        # Regex for constraining text generation to paralinguistics only (e.g. [laughing], &=laughs) when using external 
+        # asr / llm instead of native transcription / response generation. Matches here indicate that generation should 
+        # stop and the last token be discarded.
+        self.constrained_text_gen_stop_regex = re.compile(r"\A(?:[^ ]| [^&[]| &[^=]| &=.* | \[.*\] )")
+        # Wordlist of allowed backchannels and fillers when using external asr / llm instead of native transcription / response generation. 
+        # Generation of a free-standing word (not in [...] or &=...) outside this list indicates that generation should stop and the last token be discarded.
+        self.constrained_text_gen_wordlist = set(["yeah", "sure", "right", "okay", "well", "so", "and", "like", "you", "know", "uh", "huh", "um", "oh", "ah", "mm", "mmm", "hm", "hmm", "mhm", "mhmm"])
 
         self.reset()
 
@@ -56,7 +64,7 @@ class RealtimeAgent:
         self.set_sampler()
         self.resources.llm.reset()
         if c.use_external_llm:
-            self.external_llm.reset()
+            self.llm_client.close_stream(blocking=True)
         if c.use_external_tts:
             self.tts_client.close_stream()
         
@@ -101,7 +109,7 @@ class RealtimeAgent:
                 "text": c.agent_opening_text,
                 "time_secs": 0.0,
                 "text_start_pos": self.context_start_pos,
-                "external": False,
+                "text_with_external_markers": c.agent_opening_text,
             })
             if c.use_external_tts:
                 self.tts_client.prep_stream(c.agent_opening_text)
@@ -117,15 +125,22 @@ class RealtimeAgent:
         self.end_header_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_header_token)
         self.start_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.start_audio_token)
         self.end_audio_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_audio_token)
+        self.external_marker_token_id = self.resources.tokenizer.encode(self.config.external_marker_token, add_special_tokens=False)[0]
         self.agent_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.agent_identity}", add_special_tokens=False)[0]
         self.user_speaker_token_id = self.resources.tokenizer.encode(f" {self.config.user_identity}", add_special_tokens=False)[0]
 
-        self.external_llm = None
+        if self.llm_client is not None:
+            self.llm_client.close_stream(blocking=True)
+        self.llm_client = None
         if self.config.use_external_llm:
-            if self.resources.external_llm is None:
-                raise ValueError("External LLM model is not loaded.")
-            from .external_llm import ExternalLLMHandler
-            self.external_llm = ExternalLLMHandler(self.resources, self.config)
+            from .external_llm_client import ExternalLLMClient
+            self.llm_client = ExternalLLMClient(
+                api_key=self.config.external_llm_api_key, 
+                base_url=self.config.external_llm_base_url,
+                model=self.config.external_llm_model,
+                agent_identity=self.config.agent_identity,
+                allow_laughter=self.config.constrain_allow_laughter,
+            )
 
         if self.tts_client is not None:
             self.tts_client.close_stream()
@@ -164,6 +179,144 @@ class RealtimeAgent:
             self.trim_to_secs += self.config.trim_by_secs
             self.recompute_kv_cache(0)
 
+    def _native_generate_text(self, constrained: bool = False, allowed_wordlist: Optional[Set[str]] = None) -> int:
+        text_start_pos = len(self.input_ids)
+        text_start_n_tokens = self.resources.llm.n_tokens
+        while True:
+            next_token = next(self.resources.llm.generate(self.input_ids[-1:], reset=False))
+            self.input_ids.append(next_token)
+            if next_token == self.start_audio_token_id:
+                break
+            # if constrained we only allow paralinguistic content from the model
+            if constrained:
+                text = self.resources.tokenizer.decode(self.input_ids[text_start_pos:], skip_special_tokens=False).lower()
+                if text == ":":
+                    text_start_pos = len(self.input_ids)
+                    text_start_n_tokens = self.resources.llm.n_tokens 
+                elif re.match(self.constrained_text_gen_stop_regex, text) and (not allowed_wordlist or text.split()[-1] not in allowed_wordlist):
+                    self.input_ids = self.input_ids[:-1]
+                    self.resources.llm.n_tokens -= 1
+                    break
+        # Check for conditions requiring a rollback
+        if constrained and len(self.input_ids) > text_start_pos:
+            text = self.resources.tokenizer.decode(self.input_ids[text_start_pos:], skip_special_tokens=False).lower()
+            if (
+                (not self.config.constrain_allow_noise and ("noise" in text or "wind" in text or "blow" in text or "mn" in text)) or
+                (not self.config.constrain_allow_breathing and ("breath" in text or "hh" in text or "cough" in text)) or
+                (not self.config.constrain_allow_laughter and "laugh" in text)
+            ):
+                self.input_ids = self.input_ids[:text_start_pos]
+                self.resources.llm.n_tokens = text_start_n_tokens
+        return len(self.input_ids)-text_start_pos
+
+    def _coordinated_generate_text(self) -> List[Tuple[int, int]]:
+        external_pos_ranges = []
+        next_response_sentence = self.llm_client.next_sentence()
+        if next_response_sentence is None:
+            self.llm_client.prep_stream(
+                transcript=self.transcript,
+                additional_instructions=self.config.external_llm_instructions,
+                top_p=self.config.external_llm_top_p,
+            )
+            next_response_sentence = self.llm_client.next_sentence()
+        if next_response_sentence is None or next_response_sentence.lower().startswith("[silen"):
+            return external_pos_ranges
+        ext_start_pos = len(self.input_ids)
+        while True:
+            next_response_sentence = next_response_sentence.lower().replace(",", "").replace(".", "")
+            next_response_sentence = f" {next_response_sentence}"
+            next_response_input_ids = self.resources.tokenizer.encode(next_response_sentence, add_special_tokens=False)
+            self.input_ids.extend(next_response_input_ids)
+            self.resources.llm.eval(self.input_ids[-len(next_response_input_ids)-1:-1])
+            n_native = self._native_generate_text(constrained=True, allowed_wordlist=self.constrained_text_gen_wordlist)
+            if n_native > 0:
+                ext_end_pos = len(self.input_ids)-n_native
+                external_pos_ranges.append((ext_start_pos, ext_end_pos))
+                ext_start_pos = len(self.input_ids)
+            if self.input_ids[-1] == self.start_audio_token_id:
+                break
+            next_response_sentence = self.llm_client.next_sentence()
+            if next_response_sentence is None:
+                ext_end_pos = len(self.input_ids)
+                if ext_end_pos > ext_start_pos:
+                    external_pos_ranges.append((ext_start_pos, ext_end_pos))
+                break
+        return external_pos_ranges
+
+    def _complete_or_rollback_generate(self, text_start_pos: int, text_start_n_tokens: int, external_pos_ranges: List[Tuple[int, int]]) -> bool:
+        # If nothing was generated, suppress the generation by removing the end_audio_token_id and speaker id.
+        # Otherwise end with start_audio_token_id and update the transcript.
+        if len(self.input_ids)-text_start_pos < 2:
+            self.input_ids = self.input_ids[:text_start_pos-2]
+            self.resources.llm.n_tokens = text_start_n_tokens-3
+            return False
+        else:
+            if self.input_ids[-1] != self.start_audio_token_id:
+                self.resources.llm.eval(self.input_ids[-1:])
+                self.input_ids.append(self.start_audio_token_id)
+            self.update_transcript(text_start_pos-1, external_pos_ranges)
+            return True
+
+    def generate_for_trans(self) -> None:
+        assert self.input_ids[-2] == self.end_audio_token_id and self.input_ids[-1] != self.agent_speaker_token_id, \
+            "generate_for_trans can only be called if self.input_ids ends with end_audio_token_id followed by a non-agent speaker id."
+        # Record state at start in case we need to undo (e.g. if transcription is suppressed)
+        text_start_pos = len(self.input_ids)
+        text_start_n_tokens = self.resources.llm.n_tokens
+        # Generate natively
+        self.set_sampler(for_trans=True)
+        self._native_generate_text(constrained=self.config.use_whisper)
+        # If using whisper, call it now
+        external_pos_ranges = []
+        if self.config.use_whisper:
+            trans_input_ids = self.whisper_trans()
+            if trans_input_ids:
+                if self.input_ids[-1] == self.start_audio_token_id:
+                    self.input_ids = self.input_ids[:-1]
+                else:
+                    self.resources.llm.eval(self.input_ids[-1:])
+                ext_start_pos = len(self.input_ids)
+                self.input_ids.extend(trans_input_ids)
+                ext_end_pos = len(self.input_ids)
+                self.resources.llm.eval(self.input_ids[ext_start_pos:ext_end_pos-1])
+                external_pos_ranges.append((ext_start_pos, ext_end_pos))
+                # Give native lm a chance to add any trailing paralinguistic tokens
+                self._native_generate_text(constrained=True, allowed_wordlist=self.constrained_text_gen_wordlist)
+        self.set_sampler()
+        completed = self._complete_or_rollback_generate(text_start_pos, text_start_n_tokens, external_pos_ranges)
+        if completed and self.config.use_external_llm:
+            # Prepare the external llm stream in advance to reduce latency
+            self.llm_client.prep_stream(
+                transcript=self.transcript,
+                additional_instructions=self.config.external_llm_instructions,
+                top_p=self.config.external_llm_top_p,
+            )
+        self.can_force_trans = False
+
+    def generate_for_response(self) -> None:
+        assert self.input_ids[-2] == self.end_audio_token_id and self.input_ids[-1] == self.agent_speaker_token_id, \
+            "generate_for_response can only be called if self.input_ids ends with end_audio_token_id followed by the agent speaker id."
+        self.finalize_last_response()
+        # Record state at start in case we need to undo (e.g. if response is suppressed)
+        text_start_pos = len(self.input_ids)
+        text_start_n_tokens = self.resources.llm.n_tokens
+        # Generate natively
+        allowed_wordlist = self.constrained_text_gen_wordlist \
+            if self.config.use_external_llm and (self.llm_client.stream is None or self.llm_client.stream_read_count == 0) \
+            else None
+        self._native_generate_text(constrained=self.config.use_external_llm, allowed_wordlist=allowed_wordlist)
+        # If using external LLM, call it now
+        external_pos_ranges = []
+        if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id:
+            speaker_logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
+            user_prob = softmax(speaker_logits)[self.user_speaker_token_id]
+            if user_prob < self.config.external_llm_suppress_threshold:
+                external_pos_ranges = self._coordinated_generate_text()
+        self._complete_or_rollback_generate(text_start_pos, text_start_n_tokens, external_pos_ranges)
+        # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
+        # this prevents duplicate responses when self.config.force_response_after_inactivity_secs > 0.0.
+        self.ch1_inactivity_elapsed_secs = 0.0
+
     def process_audio_input_ids(
         self, 
         audio_chunk_input_ids: List[int], 
@@ -174,20 +327,16 @@ class RealtimeAgent:
         for i in range(len(audio_chunk_input_ids)):
             # trim the sequences to the maximum length
             self.trim_sequences()
-            text_start_pos = None
             while True:
                 # predict next token
                 audio_mode = all([t > self.end_header_token_id for t in self.input_ids[-2:]])
-                last_n = 2 if audio_mode else 1
-                if force_trans or force_response:
-                    self.resources.llm.eval(self.input_ids[-last_n:])
-                    if force_trans:
-                        next_token = self.end_audio_token_id if audio_mode else self.user_speaker_token_id
-                        force_trans = audio_mode
-                    else:
-                        next_token = self.end_audio_token_id if audio_mode else self.agent_speaker_token_id
-                        force_response = audio_mode        
+                if audio_mode and (force_trans or force_response):
+                    self.input_ids.append(self.end_audio_token_id)
+                    self.resources.llm.eval(self.input_ids[-3:])
+                    next_token = self.user_speaker_token_id if force_trans else self.agent_speaker_token_id
+                    force_trans = force_response = False
                 else:
+                    last_n = 2 if audio_mode else 1
                     next_token = next(self.resources.llm.generate(self.input_ids[-last_n:], reset=False))
                 self.input_ids.append(next_token)
                 # if next token is an audio token, append the next input (user) audio token
@@ -196,49 +345,12 @@ class RealtimeAgent:
                     self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
                     out_chunk_input_ids[i] = next_token
                     break # move on to next input token
-                # if next token is end_audio_token, note the position
-                elif next_token == self.end_audio_token_id:
-                    text_start_pos = len(self.input_ids)
-                # if the previous token was end_audio_token and next token is *not* the agent speaker token,
-                # transcribe with whisper or set the sampler for native transcription
+                # if the previous token was end_audio_token and next token is *not* the agent speaker token, do transcription
                 elif self.input_ids[-2] == self.end_audio_token_id and next_token != self.agent_speaker_token_id:
-                    trans_input_ids = None
-                    if self.config.use_whisper:
-                        trans_input_ids = self.whisper_trans()
-                    if trans_input_ids is not None:
-                        self.input_ids.extend(trans_input_ids + [self.start_audio_token_id])
-                        self.update_transcript(text_start_pos, external=True)
-                        self.resources.llm.eval(self.input_ids[text_start_pos:-1])
-                    else:
-                        self.set_sampler(for_trans=True)
-                    self.can_force_trans = False
-                # if the previous token was end_audio_token and next token *is* the agent speaker token, prepare to generate agent utterance text.
-                # if use_external_llm is True, call the external LLM now instead of generating the agent utterance text natively
+                    self.generate_for_trans()
+                # if the previous token was end_audio_token and next token *is* the agent speaker token, do response generation
                 elif self.input_ids[-2] == self.end_audio_token_id and next_token == self.agent_speaker_token_id:
-                    text_start_pos += self.finalize_last_response()
-                    response_suppressed = False
-                    if self.config.use_external_llm:
-                        speaker_logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
-                        user_prob = softmax(speaker_logits)[self.user_speaker_token_id]
-                        response_suppressed = user_prob >= self.config.external_llm_suppress_threshold
-                        if not response_suppressed:
-                            response_input_ids = self.external_llm.generate_response()
-                            response_suppressed = response_input_ids is None
-                            if not response_suppressed:
-                                self.input_ids.extend(response_input_ids[1:] + [self.start_audio_token_id])
-                                self.update_transcript(text_start_pos, external=True)
-                    if response_suppressed:
-                        self.input_ids = self.input_ids[:-2]
-                        self.resources.llm.n_tokens -= 3
-                    else:
-                        # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
-                        # this prevents duplicate responses when self.config.force_response_after_inactivity_secs > 0.0.
-                        self.ch1_inactivity_elapsed_secs = 0.0
-                # if next token is start_audio_token, update the transcript and reset the sampler for audio generation
-                elif next_token == self.start_audio_token_id:
-                    self.update_transcript(text_start_pos)
-                    self.set_sampler()
-                    
+                    self.generate_for_response()
         return out_chunk_input_ids
     
     def process_tts_input_ids(
@@ -268,13 +380,13 @@ class RealtimeAgent:
         trans_audio_start_chunks, rem_samples = divmod(trans_audio_start_samples, self.chunk_size_samples)
         trans_audio = np.concatenate(self.audio_history_ch2[trans_audio_start_chunks:])[rem_samples:]
         transcription = self._whisper_trans(trans_audio)
-        transcription = transcription.lower().replace("[blank_audio]", "").replace("...", "").replace(",", "").replace(".", "").replace(">>", "").strip()
+        transcription = self._clean_whisper_text(transcription)
         if not transcription:
             return None
-        transcription = f": {transcription}"
+        transcription = f" {transcription}"
         trans_input_ids = self.resources.tokenizer.encode(transcription, add_special_tokens=False)
         return trans_input_ids
-    
+
     def _whisper_trans(self, trans_audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
         trans_audio = self.resources.audio_tokenizer._prep_audio_for_tokenization(trans_audio)
         segments = self.resources.whisper_model.transcribe(
@@ -287,6 +399,22 @@ class RealtimeAgent:
         )
         transcription = " ".join([segment.text for segment in segments])
         return transcription
+    
+    def _clean_whisper_text(self, text: str) -> str:
+        text = text.lower()
+        text = text.replace("[ ", "[")
+        text = text.replace(" ]", "]")
+        text = text.replace("[blank_audio]", "")
+        text = text.replace("[inaudible]", "")
+        text = text.replace("[silence]", "")
+        text = text.replace("[pause]", "")
+        text = text.replace("mm-hmm", "mhm")
+        text = text.replace("...", "")
+        text = text.replace(",", "")
+        text = text.replace(".", "")
+        text = text.replace(">>", "")
+        text = text.strip()
+        return text
 
     def update_inactivity_timers(self, audio_chunk: np.ndarray) -> None:
         # channel 2 (input)
@@ -375,7 +503,7 @@ class RealtimeAgent:
                 f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}"
             return out_chunk
 
-    def update_transcript(self, text_start_pos: int, external: bool = False) -> None:
+    def update_transcript(self, text_start_pos: int, external_pos_ranges: List[Tuple[int, int]] = []) -> None:
         if text_start_pos is None:
             warn(
                 "No text start position found, skipping transcript update. "
@@ -383,16 +511,20 @@ class RealtimeAgent:
                 "This should never happen - investigate this!"
             )
             return
-        text_str = self.resources.tokenizer.decode(self.input_ids[text_start_pos:-1], skip_special_tokens=False)
+        decode_input_ids = self.input_ids[text_start_pos:-1]
+        for start_pos, end_pos in reversed(external_pos_ranges):
+            decode_input_ids.insert(end_pos-text_start_pos, self.external_marker_token_id)
+            decode_input_ids.insert(start_pos-text_start_pos, self.external_marker_token_id)
+        text_str = self.resources.tokenizer.decode(decode_input_ids, skip_special_tokens=False)
         # It is possible for there to be multiple speaker utterances in the same text chunk, so we extract them with regex
         transcript_entries = []
         for speaker, sp_text in self.transcript_regex.findall(text_str):
-            sp_text = sp_text.lstrip()
+            sp_text_with_external_markers = sp_text.lstrip()
+            sp_text = sp_text_with_external_markers.replace(self.config.external_marker_token, "").lstrip()
             if speaker != self.config.agent_identity:
-                if self.config.use_external_llm:
-                    self.external_llm.process_user_text(sp_text)
                 # TODO: If the speaker is not the agent, the text is a transcription in audio-first interleave mode and
                 # we need to subtract the utterance length from time_secs.
+                pass
             elif self.config.use_external_tts:
                 self.tts_client.prep_stream(sp_text)
             transcript_entries.append({
@@ -400,24 +532,24 @@ class RealtimeAgent:
                 "text": sp_text,
                 "time_secs": self.total_secs,
                 "text_start_pos": text_start_pos, # TODO: this is not accurate if there are multiple utterances
-                "external": external,
+                "text_with_external_markers": sp_text_with_external_markers,
             })
         self.transcript.extend(
             sorted(transcript_entries, key=lambda x: x["time_secs"])
         )
 
-    def finalize_last_response(self) -> int:
+    def finalize_last_response(self) -> None:
         last_response = self.last_response
         if last_response is None:
-            return 0
+            return
         if last_response.get("planned_text"):
-            return 0
+            return
         last_response["planned_text"] = last_response["text"]
         last_response_start_secs = last_response["time_secs"]
         last_response_end_secs = min(self.total_secs - self.ch1_inactivity_elapsed_secs, last_response_start_secs + 10.0)
         if last_response_end_secs <= last_response_start_secs:
             # TODO: no response audio - response should be removed from transcript?
-            return 0
+            return
         last_response_audio_input_ids = self.get_audio_tokens(last_response_start_secs, last_response_end_secs)
         c = self.config
         af_ctx_prompt = "".join([
@@ -462,7 +594,7 @@ class RealtimeAgent:
                 break
         final_text_input_ids = txt_input_ids[:i+1]
         if len(final_text_input_ids) == len(txt_input_ids):
-            return 0
+            return
         elif len(final_text_input_ids) == 0:
             final_text_input_ids = self.resources.tokenizer.encode(" [silence]", add_special_tokens=False)
         # else:
@@ -481,7 +613,6 @@ class RealtimeAgent:
                 if self.audio_tokens_idx[i] <= text_end_pos:
                     break
                 self.audio_tokens_idx[i] += input_ids_diff
-        return input_ids_diff
 
     def frames_from_secs(self, secs: float) -> int:
         frames = int(secs * self.resources.audio_tokenizer.framerate * 2)
@@ -544,16 +675,20 @@ class RealtimeAgent:
         formatted_lines = []
         for entry in self.transcript:
             if "planned_text" in entry and entry["text"] != entry["planned_text"]:
+                #TODO: handle external markers in planned_text
                 planned_text = entry["planned_text"] \
                     if entry["text"] == "[silence]" else entry["planned_text"][len(entry["text"]):].lstrip()
                 entry_text = f"{entry['text']}  ⟶  {{{planned_text}}}"
             else:
-                entry_text = entry['text']
-            if entry["external"]:
-                entry_text += " †"
-            formatted_lines.append(f"[{timedelta(seconds=int(entry['time_secs']))}] {entry['speaker']}: {entry_text}")
+                entry_text = entry["text_with_external_markers"]
+            formatted_lines.append(f"[{timedelta(seconds=int(entry["time_secs"]))}] {entry["speaker"]}: {entry_text}")
         formatted_transcript = "\n".join(formatted_lines)
         return formatted_transcript
+    
+    def get_external_llm_messages(self):
+        if self.llm_client is None:
+            return None
+        return self.llm_client.get_messages(self.transcript, self.config.external_llm_instructions)
 
 @dataclass
 class RealtimeAgentMultiprocessingInfo:
@@ -637,7 +772,7 @@ class RealtimeAgentMultiprocessing:
                         transcript=agent.format_transcript(),
                         sequence=agent.get_sequence_str(),
                         audio_history=agent.get_audio_history(),
-                        external_llm_messages=agent.external_llm.messages if agent.external_llm is not None else None,
+                        external_llm_messages=agent.get_external_llm_messages(),
                     )
                     self.info_queue.put(info)
                     self.get_info_flag.value = False

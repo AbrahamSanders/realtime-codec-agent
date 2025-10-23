@@ -7,6 +7,7 @@ import librosa
 import matplotlib.pyplot as plt
 
 from realtime_codec_agent import RealtimeAgent, RealtimeAgentResources, add_common_inference_args
+from realtime_codec_agent.external_llm_client import ExternalLLMClient
 from realtime_codec_agent.utils.audio_utils import pad_or_trim
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,9 @@ def set_config_and_reset(
     external_llm_instructions: str,
     use_external_tts: bool,
     external_tts_prompt_text: str,
+    constrain_allow_noise: bool,
+    constrain_allow_breathing: bool,
+    constrain_allow_laughter: bool,
     run_profilers: bool,
 ):
     config = agent.config
@@ -61,6 +65,9 @@ def set_config_and_reset(
     config.external_llm_instructions = external_llm_instructions
     config.use_external_tts = bool(use_external_tts)
     config.external_tts_prompt_text = external_tts_prompt_text
+    config.constrain_allow_noise = bool(constrain_allow_noise)
+    config.constrain_allow_breathing = bool(constrain_allow_breathing)
+    config.constrain_allow_laughter = bool(constrain_allow_laughter)
     config.run_profilers = bool(run_profilers)
 
     if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
@@ -101,7 +108,7 @@ def run_agent(
                 out_history = agent.get_audio_history()
                 transcript = agent.format_transcript()
                 sequence = agent.get_sequence_str()
-                external_llm_messages = agent.external_llm.messages if agent.external_llm is not None else None
+                external_llm_messages = agent.get_external_llm_messages()
                 yield realtime_plot, (sr, out_history.T), transcript, sequence, external_llm_messages
             elif realtime_plot is not None:
                 yield realtime_plot, None, None, None, None
@@ -117,13 +124,12 @@ if __name__ == "__main__":
     agent = RealtimeAgent(
         resources=RealtimeAgentResources(
             llm_model_path=args.llm_model_path,
-            external_llm_repo_id=args.external_llm_repo_id,
-            external_llm_filename=args.external_llm_filename,
-            external_llm_tokenizer_repo_id=args.external_llm_tokenizer_repo_id,
         ),
     )
 
     config = agent.config
+    external_llm_models = ExternalLLMClient.get_models(config.external_llm_api_key, config.external_llm_base_url)
+    external_llm_model = external_llm_models[0].split("/")[-1] if len(external_llm_models) > 0 else None
     interface = gr.Interface(
         fn=run_agent,
         inputs=[
@@ -153,10 +159,13 @@ if __name__ == "__main__":
             gr.Number(config.trim_by_secs, minimum=1.0, maximum=20.0, step=1.0, label="Trim By (seconds)"),
             gr.Slider(0.0, 0.1, value=config.target_volume_rms, step=0.01, label="Volume Normalization (0 to disable)"),
             gr.Slider(0.0, 10.0, value=config.force_response_after_inactivity_secs, step=0.1, label="Force Response After Inactivity (seconds, 0 to disable)"),
-            gr.Checkbox(config.use_external_llm, label=f"Use External LLM ({args.external_llm_repo_id})"),
+            gr.Checkbox(config.use_external_llm, label=f"Use External LLM ({external_llm_model})", interactive=bool(external_llm_model)),
             gr.TextArea(config.external_llm_instructions, label="External LLM Instructions"),
             gr.Checkbox(config.use_external_tts, label="Use External TTS (VoxCPM) for Speech Generation"),
             gr.Textbox(config.external_tts_prompt_text, label="External TTS Voice Enrollment Prompt Text"),
+            gr.Checkbox(config.constrain_allow_noise, label="Constraint: Allow Noise"),
+            gr.Checkbox(config.constrain_allow_breathing, label="Constraint: Allow Breathing"),
+            gr.Checkbox(config.constrain_allow_laughter, label="Constraint: Allow Laughter"),
             gr.Checkbox(config.run_profilers, label="Run Profilers"),
         ], 
         outputs=[
