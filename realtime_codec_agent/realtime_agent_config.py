@@ -10,7 +10,7 @@ class RealtimeAgentConfig:
     user_identity: str = "B"
     temperature: float = 1.0
     trans_temperature: float = 0.0
-    force_trans_after_inactivity_secs: float = 1.0
+    force_trans_after_inactivity_secs: float = 0.5
     use_whisper: bool = True
     top_k: int = 100
     top_p: float = 1.0
@@ -24,7 +24,6 @@ class RealtimeAgentConfig:
     trim_by_secs: float = 20.0
     target_volume_rms: float = 0.0
     force_response_after_inactivity_secs: float = 3.0
-    activity_abs_max_threshold: float = 100 / 32768.0
     seed: Optional[int] = 42
     header_audio_first_token: str = "<|audio_first|>"
     header_text_only_token: str = "<|text_only|>"
@@ -41,7 +40,6 @@ class RealtimeAgentConfig:
     external_llm_model: Optional[str] = None
     external_llm_top_p: float = 0.9
     external_llm_instructions: Optional[str] = None
-    external_llm_suppress_threshold: float = 0.1
     use_external_tts: bool = False
     external_tts_server_url: str = "http://localhost:8001"
     external_tts_prompt_text: Optional[str] = None

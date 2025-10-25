@@ -4,12 +4,13 @@ import time
 from scipy.special import softmax
 from dataclasses import dataclass
 from warnings import warn
-from datetime import timedelta, datetime
+from datetime import datetime
 from typing import Union, Optional, List, Dict, Any, Tuple, Set
 
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
 from .realtime_agent_resources import RealtimeAgentResources
 from .realtime_agent_config import RealtimeAgentConfig
+from .realtime_agent_stats import RealtimeAgentStatsCollection
 from .realtime_agent_profiler import RealtimeAgentProfilerCollection
 
 class RealtimeAgent:
@@ -98,7 +99,7 @@ class RealtimeAgent:
         self.trim_to_secs = 0.0
         self.ch1_inactivity_elapsed_secs = 0.0
         self.ch2_inactivity_elapsed_secs = 0.0
-        self.can_force_trans = False
+        self.ch2_activity_start_secs = 0.0
         self.audio_history_ch1: List[np.ndarray] = [] 
         self.audio_history_ch2: List[np.ndarray] = []
         self.audio_tokens_idx = []
@@ -107,13 +108,15 @@ class RealtimeAgent:
             self.transcript.append({
                 "speaker": c.agent_identity,
                 "text": c.agent_opening_text,
-                "time_secs": 0.0,
+                "start_secs": 0.0,
+                "end_secs": None,
                 "text_start_pos": self.context_start_pos,
                 "text_with_external_markers": c.agent_opening_text,
             })
             if c.use_external_tts:
                 self.tts_client.prep_stream(c.agent_opening_text)
 
+        self.stats.reset()
         self.profilers.reset()
 
     def set_config(self, config: RealtimeAgentConfig):
@@ -159,6 +162,7 @@ class RealtimeAgent:
                 chunk_frames = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.framerate)
                 self.default_tts_fallback_chunk = self.resources.audio_tokenizer.tokenize_audio(silence)[-chunk_frames:]
 
+        self.stats = RealtimeAgentStatsCollection(self.config)
         self.profilers = RealtimeAgentProfilerCollection(self.config)
 
     def set_sampler(self, for_trans: bool = False) -> None:
@@ -291,7 +295,10 @@ class RealtimeAgent:
                 additional_instructions=self.config.external_llm_instructions,
                 top_p=self.config.external_llm_top_p,
             )
-        self.can_force_trans = False
+        elif not completed:
+            # since the transcription was suppressed, the transcription probability could still be high.
+            # reset the channel 2 inactivity timer to avoid immediate forced transcription again.
+            self.ch2_inactivity_elapsed_secs = 0.0
 
     def generate_for_response(self) -> None:
         assert self.input_ids[-2] == self.end_audio_token_id and self.input_ids[-1] == self.agent_speaker_token_id, \
@@ -307,11 +314,8 @@ class RealtimeAgent:
         self._native_generate_text(constrained=self.config.use_external_llm, allowed_wordlist=allowed_wordlist)
         # If using external LLM, call it now
         external_pos_ranges = []
-        if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id:
-            speaker_logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
-            user_prob = softmax(speaker_logits)[self.user_speaker_token_id]
-            if user_prob < self.config.external_llm_suppress_threshold:
-                external_pos_ranges = self._coordinated_generate_text()
+        if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id and self.stats.transcription_prob.last_zscore < 0.0:
+            external_pos_ranges = self._coordinated_generate_text()
         self._complete_or_rollback_generate(text_start_pos, text_start_n_tokens, external_pos_ranges)
         # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
         # this prevents duplicate responses when self.config.force_response_after_inactivity_secs > 0.0.
@@ -375,7 +379,7 @@ class RealtimeAgent:
         if self.resources.whisper_model is None:
             raise ValueError("Whisper model is not loaded.")
         last_trans = self.last_transcription
-        trans_audio_start_secs = last_trans["time_secs"] if last_trans else 0.0
+        trans_audio_start_secs = last_trans["end_secs"] + self.config.chunk_size_secs if last_trans is not None else 0.0
         trans_audio_start_samples = int(trans_audio_start_secs * self.resources.audio_tokenizer.sampling_rate)
         trans_audio_start_chunks, rem_samples = divmod(trans_audio_start_samples, self.chunk_size_samples)
         trans_audio = np.concatenate(self.audio_history_ch2[trans_audio_start_chunks:])[rem_samples:]
@@ -388,7 +392,11 @@ class RealtimeAgent:
         return trans_input_ids
 
     def _whisper_trans(self, trans_audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
+        # TODO: we assume that whisper uses the same sampling rate as the codec (16kHz), which is correct for now. This could change
+        # in the future if a different codec is used. A better approach would be to refactor _prep_audio_for_tokenization out of audio_tokenizer
+        # and pass in whisper's sampling rate explicitly.
         trans_audio = self.resources.audio_tokenizer._prep_audio_for_tokenization(trans_audio)
+        trans_audio = pad_or_trim(trans_audio, max(trans_audio.shape[-1], int(1.2*self.resources.audio_tokenizer.sampling_rate)), pad_side="left")
         segments = self.resources.whisper_model.transcribe(
             trans_audio, 
             temperature=self.config.trans_temperature,
@@ -416,27 +424,43 @@ class RealtimeAgent:
         text = text.strip()
         return text
 
+    def measure_event_probs(self):
+        logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
+        probs = softmax(logits)
+        end_audio_prob = probs[self.end_audio_token_id]
+        _ = next(self.resources.llm.generate([self.end_audio_token_id], reset=False))
+        logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
+        probs = softmax(logits)
+        response_prob, trans_prob = probs[[self.agent_speaker_token_id, self.user_speaker_token_id]] * end_audio_prob
+        self.stats.transcription_prob.add_value(trans_prob)
+        self.stats.response_prob.add_value(response_prob)
+        self.resources.llm.n_tokens -= 1
+
     def update_inactivity_timers(self, audio_chunk: np.ndarray) -> None:
         # channel 2 (input)
+        prev_ch2_abs_max_zscore = self.stats.ch2_abs_max.last_zscore
         curr_in_chunk_abs_max = np.abs(audio_chunk).max()
-        if curr_in_chunk_abs_max >= self.config.activity_abs_max_threshold:
+        self.stats.ch2_abs_max.add_value(curr_in_chunk_abs_max)
+        if self.stats.ch2_abs_max.last_zscore >= 0.0:
             self.ch2_inactivity_elapsed_secs = 0.0
-            self.can_force_trans = True
+            if prev_ch2_abs_max_zscore < 0.0:
+                self.ch2_activity_start_secs = self.total_secs
         else:
             self.ch2_inactivity_elapsed_secs += self.config.chunk_size_secs
         
         # channel 1 (output)
         curr_out_chunk = self.audio_history_ch1[-1] if len(self.audio_history_ch1) > 0 else None
         curr_out_chunk_abs_max = 0.0 if curr_out_chunk is None else np.abs(curr_out_chunk).max()
-        if curr_out_chunk_abs_max >= self.config.activity_abs_max_threshold:
+        self.stats.ch1_abs_max.add_value(curr_out_chunk_abs_max)
+        if self.stats.ch1_abs_max.last_zscore >= 0.0:
             self.ch1_inactivity_elapsed_secs = 0.0
         else:
             self.ch1_inactivity_elapsed_secs += self.config.chunk_size_secs
 
     def should_force_transcription(self) -> bool:
-        if self.config.force_trans_after_inactivity_secs == 0.0 or not self.can_force_trans:
+        if self.config.force_trans_after_inactivity_secs == 0.0:
             return False
-        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs
+        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs and self.stats.transcription_prob.last_zscore >= 0.5
     
     def should_force_response(self) -> bool:
         if self.config.force_response_after_inactivity_secs == 0.0:
@@ -467,6 +491,7 @@ class RealtimeAgent:
             
             # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
             with self.profilers.lm_profiler:
+                self.measure_event_probs()
                 self.update_inactivity_timers(audio_chunk)
                 force_trans = self.should_force_transcription()
                 force_response = self.should_force_response()
@@ -517,26 +542,29 @@ class RealtimeAgent:
             decode_input_ids.insert(start_pos-text_start_pos, self.external_marker_token_id)
         text_str = self.resources.tokenizer.decode(decode_input_ids, skip_special_tokens=False)
         # It is possible for there to be multiple speaker utterances in the same text chunk, so we extract them with regex
-        transcript_entries = []
         for speaker, sp_text in self.transcript_regex.findall(text_str):
             sp_text_with_external_markers = sp_text.lstrip()
             sp_text = sp_text_with_external_markers.replace(self.config.external_marker_token, "").lstrip()
             if speaker != self.config.agent_identity:
-                # TODO: If the speaker is not the agent, the text is a transcription in audio-first interleave mode and
-                # we need to subtract the utterance length from time_secs.
-                pass
-            elif self.config.use_external_tts:
-                self.tts_client.prep_stream(sp_text)
-            transcript_entries.append({
+                last_trans = self.last_transcription
+                last_trans_end_secs = last_trans["end_secs"] if last_trans is not None else 0.0
+                start_secs = max(self.ch2_activity_start_secs, last_trans_end_secs) \
+                    if self.ch2_activity_start_secs < self.total_secs-self.ch2_inactivity_elapsed_secs else last_trans_end_secs
+                end_secs = self.total_secs
+            else:
+                start_secs = self.total_secs
+                end_secs = None
+                if self.config.use_external_tts:
+                    self.tts_client.prep_stream(sp_text)
+            self.transcript.append({
                 "speaker": speaker,
                 "text": sp_text,
-                "time_secs": self.total_secs,
+                "start_secs": start_secs,
+                "end_secs": end_secs,
                 "text_start_pos": text_start_pos, # TODO: this is not accurate if there are multiple utterances
                 "text_with_external_markers": sp_text_with_external_markers,
             })
-        self.transcript.extend(
-            sorted(transcript_entries, key=lambda x: x["time_secs"])
-        )
+        self.transcript.sort(key=lambda x: x["start_secs"])
 
     def finalize_last_response(self) -> None:
         last_response = self.last_response
@@ -545,11 +573,12 @@ class RealtimeAgent:
         if last_response.get("planned_text"):
             return
         last_response["planned_text"] = last_response["text"]
-        last_response_start_secs = last_response["time_secs"]
+        last_response_start_secs = last_response["start_secs"]
         last_response_end_secs = min(self.total_secs - self.ch1_inactivity_elapsed_secs, last_response_start_secs + 10.0)
         if last_response_end_secs <= last_response_start_secs:
             # TODO: no response audio - response should be removed from transcript?
             return
+        last_response["end_secs"] = last_response_end_secs
         last_response_audio_input_ids = self.get_audio_tokens(last_response_start_secs, last_response_end_secs)
         c = self.config
         af_ctx_prompt = "".join([
@@ -671,6 +700,16 @@ class RealtimeAgent:
         )
         return audio_history
     
+    def _format_time_for_transcript(self, secs: float) -> str:
+        hours, rem = divmod(secs, 3600)
+        minutes, seconds = divmod(rem, 60)
+        return f"{int(hours)}:{int(minutes):02}:{seconds:06.3f}"
+    
+    def _format_start_end_for_transcript(self, entry: Dict[str, Any]) -> str:
+        start_str = self._format_time_for_transcript(entry["start_secs"])
+        end_str = self._format_time_for_transcript(entry["end_secs"] if entry["end_secs"] is not None else self.total_secs)
+        return f"{start_str} - {end_str}"
+
     def format_transcript(self) -> str:
         formatted_lines = []
         for entry in self.transcript:
@@ -681,7 +720,7 @@ class RealtimeAgent:
                 entry_text = f"{entry['text']}  ⟶  {{{planned_text}}}"
             else:
                 entry_text = entry["text_with_external_markers"]
-            formatted_lines.append(f"[{timedelta(seconds=int(entry["time_secs"]))}] {entry["speaker"]}: {entry_text}")
+            formatted_lines.append(f"[{self._format_start_end_for_transcript(entry)}] {entry["speaker"]}: {entry_text}")
         formatted_transcript = "\n".join(formatted_lines)
         return formatted_transcript
     
