@@ -460,7 +460,7 @@ class RealtimeAgent:
     def should_force_transcription(self) -> bool:
         if self.config.force_trans_after_inactivity_secs == 0.0:
             return False
-        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs and self.stats.transcription_prob.last_zscore >= 0.5
+        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs and self.stats.transcription_prob.last_zscore >= 1.0
     
     def should_force_response(self) -> bool:
         if self.config.force_response_after_inactivity_secs == 0.0:
