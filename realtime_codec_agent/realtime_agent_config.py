@@ -43,7 +43,6 @@ class RealtimeAgentConfig:
     use_external_tts: bool = False
     external_tts_server_url: str = "http://localhost:8001"
     external_tts_prompt_text: Optional[str] = None
-    external_tts_interrupt_threshold: float = 10000.0
     external_tts_allow_fallback: bool = False
     constrain_allow_noise: bool = False
     constrain_allow_breathing: bool = False

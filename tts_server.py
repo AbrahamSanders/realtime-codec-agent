@@ -131,6 +131,12 @@ if __name__ == "__main__":
         help="Path to the MagiCodec model.",
     )
     parser.add_argument(
+        "--port",
+        type=int,
+        default=8001,
+        help="Port to run the server on.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Disable optimizations that could interfere with debugging."
@@ -149,4 +155,4 @@ if __name__ == "__main__":
     text_normalizer = TextNormalizer()
 
     # Development server; use a production WSGI server (gunicorn, etc.) for prod.
-    app.run(host="0.0.0.0", port=8001, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)

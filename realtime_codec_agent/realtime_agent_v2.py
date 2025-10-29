@@ -68,6 +68,7 @@ class RealtimeAgent:
             self.llm_client.close_stream(blocking=True)
         if c.use_external_tts:
             self.tts_client.close_stream()
+            self.tts_interrupted_chunk_input_ids = None
         
         voice_enrollment = np.zeros(self.resources.audio_tokenizer.sampling_rate * 3, dtype=np.float32) \
             if c.agent_voice_enrollment is None else c.agent_voice_enrollment
@@ -314,7 +315,7 @@ class RealtimeAgent:
         self._native_generate_text(constrained=self.config.use_external_llm, allowed_wordlist=allowed_wordlist)
         # If using external LLM, call it now
         external_pos_ranges = []
-        if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id and self.stats.transcription_prob.last_zscore < 0.0:
+        if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id and self.stats.event_prob.last_zscore[1] < 0.0:
             external_pos_ranges = self._coordinated_generate_text()
         self._complete_or_rollback_generate(text_start_pos, text_start_n_tokens, external_pos_ranges)
         # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
@@ -366,10 +367,17 @@ class RealtimeAgent:
             return out_chunk_input_ids
         # interrupt the external tts stream if the duplex lm's agent response predictions are diverging toward silence
         tts_interrupt_score = self.tts_duplex_aligner.interrupt_score(tts_chunk_input_ids, out_chunk_input_ids)
-        #print(f"TTS interrupt score: {tts_interrupt_score}")
-        if tts_interrupt_score >= self.config.external_tts_interrupt_threshold:
-            self.tts_client.close_stream()
+        #tts_interrupt_score = np.clip(tts_interrupt_score, 0.0, 20.0)
+        self.stats.tts_interrupt_score.add_value(tts_interrupt_score)
+        if self.stats.tts_interrupt_score.last_zscore >= 1.0:
+        #if tts_interrupt_score >= 10.0:
+            self.tts_interrupted_chunk_input_ids = tts_chunk_input_ids
+            #print("TTS stream interrupted")
             return out_chunk_input_ids
+        else:
+            # if self.tts_interrupted_chunk_input_ids is not None:
+            #     print("TTS stream resumed")
+            self.tts_interrupted_chunk_input_ids = None
         # substitute the generated audio tokens for the corresponding tts tokens
         start_frame = self.total_frames - len(out_chunk_input_ids) * 2
         self.set_audio_tokens(tts_chunk_input_ids, start_frame=start_frame, channel=0)
@@ -431,17 +439,19 @@ class RealtimeAgent:
         _ = next(self.resources.llm.generate([self.end_audio_token_id], reset=False))
         logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
         probs = softmax(logits)
-        response_prob, trans_prob = probs[[self.agent_speaker_token_id, self.user_speaker_token_id]] * end_audio_prob
-        self.stats.transcription_prob.add_value(trans_prob)
-        self.stats.response_prob.add_value(response_prob)
+        event_probs = probs[[self.agent_speaker_token_id, self.user_speaker_token_id]] * end_audio_prob
+        self.stats.event_prob.add_value(event_probs)
         self.resources.llm.n_tokens -= 1
 
     def update_inactivity_timers(self, audio_chunk: np.ndarray) -> None:
+        curr_ch1_chunk = self.audio_history_ch1[-1] if len(self.audio_history_ch1) > 0 else None
+        curr_ch1_chunk_abs_max = 0.0 if curr_ch1_chunk is None else np.abs(curr_ch1_chunk).max()
+        prev_ch2_abs_max_zscore = self.stats.ch_abs_max.last_zscore[1]
+        curr_ch2_chunk_abs_max = np.abs(audio_chunk).max()
+        self.stats.ch_abs_max.add_value((curr_ch1_chunk_abs_max, curr_ch2_chunk_abs_max))
+        
         # channel 2 (input)
-        prev_ch2_abs_max_zscore = self.stats.ch2_abs_max.last_zscore
-        curr_in_chunk_abs_max = np.abs(audio_chunk).max()
-        self.stats.ch2_abs_max.add_value(curr_in_chunk_abs_max)
-        if self.stats.ch2_abs_max.last_zscore >= 0.0:
+        if self.stats.ch_abs_max.last_zscore[1] >= 0.0:
             self.ch2_inactivity_elapsed_secs = 0.0
             if prev_ch2_abs_max_zscore < 0.0:
                 self.ch2_activity_start_secs = self.total_secs
@@ -449,10 +459,7 @@ class RealtimeAgent:
             self.ch2_inactivity_elapsed_secs += self.config.chunk_size_secs
         
         # channel 1 (output)
-        curr_out_chunk = self.audio_history_ch1[-1] if len(self.audio_history_ch1) > 0 else None
-        curr_out_chunk_abs_max = 0.0 if curr_out_chunk is None else np.abs(curr_out_chunk).max()
-        self.stats.ch1_abs_max.add_value(curr_out_chunk_abs_max)
-        if self.stats.ch1_abs_max.last_zscore >= 0.0:
+        if self.stats.ch_abs_max.last_zscore[0] >= 0.0:
             self.ch1_inactivity_elapsed_secs = 0.0
         else:
             self.ch1_inactivity_elapsed_secs += self.config.chunk_size_secs
@@ -460,7 +467,7 @@ class RealtimeAgent:
     def should_force_transcription(self) -> bool:
         if self.config.force_trans_after_inactivity_secs == 0.0:
             return False
-        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs and self.stats.transcription_prob.last_zscore >= 1.0
+        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs and self.stats.event_prob.last_zscore[1] >= 1.0
     
     def should_force_response(self) -> bool:
         if self.config.force_response_after_inactivity_secs == 0.0:
@@ -479,7 +486,9 @@ class RealtimeAgent:
                 audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)
             with self.profilers.tokenize_profiler:
                 audio_chunk_input_ids = self.resources.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
-                if self.config.use_external_tts:
+                if self.config.use_external_tts and self.tts_interrupted_chunk_input_ids is not None:
+                    tts_chunk_input_ids = self.tts_interrupted_chunk_input_ids
+                elif self.config.use_external_tts:
                     tts_chunk = self.tts_client.next_chunk()
                     if tts_chunk is None and not self.config.external_tts_allow_fallback:
                         tts_chunk = self.default_tts_fallback_chunk
@@ -556,6 +565,7 @@ class RealtimeAgent:
                 end_secs = None
                 if self.config.use_external_tts:
                     self.tts_client.prep_stream(sp_text)
+                    self.tts_interrupted_chunk_input_ids = None
             self.transcript.append({
                 "speaker": speaker,
                 "text": sp_text,
