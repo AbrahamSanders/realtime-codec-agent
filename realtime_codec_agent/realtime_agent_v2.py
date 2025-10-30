@@ -877,8 +877,8 @@ class RealtimeAgentMultiprocessing:
     def queue_input(self, input):
         self.input_queue.put(input)
 
-    def next_output(self):
-        if self.output_queue.empty():
+    def next_output(self, block: bool = False):
+        if not block and self.output_queue.empty():
             return None
         return self.output_queue.get()
     
