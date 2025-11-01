@@ -124,6 +124,7 @@ class RealtimeAgent:
         self.config = config
         
         self.chunk_size_samples = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.sampling_rate)
+        self.chunk_size_frames_per_channel = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.framerate)
         self.crossfade_ramps = create_crossfade_ramps(self.resources.audio_tokenizer.sampling_rate, fade_secs=self.config.chunk_fade_secs)
 
         self.end_header_token_id = self.resources.tokenizer.convert_tokens_to_ids(self.config.end_header_token)
@@ -160,8 +161,7 @@ class RealtimeAgent:
             if not self.config.external_tts_allow_fallback:
                 self.resources.audio_tokenizer.reset_context()
                 silence = np.zeros(self.resources.audio_tokenizer.context_samples, dtype=np.float32)
-                chunk_frames = int(self.config.chunk_size_secs * self.resources.audio_tokenizer.framerate)
-                self.default_tts_fallback_chunk = self.resources.audio_tokenizer.tokenize_audio(silence)[-chunk_frames:]
+                self.default_tts_fallback_chunk = self.resources.audio_tokenizer.tokenize_audio(silence)[-self.chunk_size_frames_per_channel:]
 
         self.stats = RealtimeAgentStatsCollection(self.config)
         self.profilers = RealtimeAgentProfilerCollection(self.config)
@@ -443,12 +443,12 @@ class RealtimeAgent:
         self.stats.event_prob.add_value(event_probs)
         self.resources.llm.n_tokens -= 1
 
-    def update_inactivity_timers(self, audio_chunk: np.ndarray) -> None:
-        curr_ch1_chunk = self.audio_history_ch1[-1] if len(self.audio_history_ch1) > 0 else None
-        curr_ch1_chunk_abs_max = 0.0 if curr_ch1_chunk is None else np.abs(curr_ch1_chunk).max()
+    def update_inactivity_timers(self) -> None:
         prev_ch2_abs_max_zscore = self.stats.ch_abs_max.last_zscore[1]
-        curr_ch2_chunk_abs_max = np.abs(audio_chunk).max()
-        self.stats.ch_abs_max.add_value((curr_ch1_chunk_abs_max, curr_ch2_chunk_abs_max))
+        self.stats.ch_abs_max.add_value((
+            np.abs(self.audio_history_ch1[-1]).max(), 
+            np.abs(self.audio_history_ch2[-1]).max(),
+        ))
         
         # channel 2 (input)
         if self.stats.ch_abs_max.last_zscore[1] >= 0.0:
@@ -500,8 +500,6 @@ class RealtimeAgent:
             
             # Generate next audio chunk (interleaved by frame with the input audio chunk) and also generate any interleaved text
             with self.profilers.lm_profiler:
-                self.measure_event_probs()
-                self.update_inactivity_timers(audio_chunk)
                 force_trans = self.should_force_transcription()
                 force_response = self.should_force_response()
                 out_chunk_input_ids = self.process_audio_input_ids(audio_chunk_input_ids, force_trans, force_response)
@@ -531,6 +529,10 @@ class RealtimeAgent:
                 # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
                 out_chunk = pad_or_trim(out_chunk[:-self.crossfade_ramps[0]], self.chunk_size_samples, pad_side="left")
             self.audio_history_ch2.append(audio_chunk)
+
+            # Update stats and timers
+            self.measure_event_probs()
+            self.update_inactivity_timers()
 
             # Sanity check - output size
             assert out_chunk.shape[-1] == self.chunk_size_samples, \
