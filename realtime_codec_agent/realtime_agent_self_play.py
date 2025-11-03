@@ -85,7 +85,7 @@ class RealtimeAgentSelfPlay:
 
             # Update stats and timers
             for agent in [self.agent_1, self.agent_2]:
-                agent.measure_event_probs()
+                agent.measure_event_prob()
                 agent.update_inactivity_timers()
 
             # Sanity check - output size

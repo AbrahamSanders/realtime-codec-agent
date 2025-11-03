@@ -24,9 +24,11 @@ class RealtimeAgentStats:
         self.std = 1.0
 
     def add_value(self, value: Union[float, Tuple[float, ...]]):
-        if isinstance(value, np.ndarray):
-            value = tuple(value.tolist())
-        if isinstance(value, float) or isinstance(value, int):
+        if isinstance(value, (np.ndarray, np.generic)):
+            value = value.tolist()
+        if isinstance(value, list):
+            value = tuple(value)
+        elif isinstance(value, float) or isinstance(value, int):
             value = (value,)
         self.values.append(value)
         self.values_zscores.append(tuple((v - self.mean) / self.std for v in value))
@@ -40,7 +42,7 @@ class RealtimeAgentStats:
 class RealtimeAgentStatsCollection:
     def __init__(self, config: RealtimeAgentConfig):
         self.ch_abs_max = RealtimeAgentStats(config, value_size=2)
-        self.event_prob = RealtimeAgentStats(config, value_size=2)
+        self.event_prob = RealtimeAgentStats(config)
         self.tts_interrupt_score = RealtimeAgentStats(config)
 
     def reset(self):

@@ -117,6 +117,7 @@ class RealtimeAgent:
             if c.use_external_tts:
                 self.tts_client.prep_stream(c.agent_opening_text)
 
+        self.prob_event_speaker_token_id = None
         self.stats.reset()
         self.profilers.reset()
 
@@ -315,7 +316,7 @@ class RealtimeAgent:
         self._native_generate_text(constrained=self.config.use_external_llm, allowed_wordlist=allowed_wordlist)
         # If using external LLM, call it now
         external_pos_ranges = []
-        if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id and self.stats.event_prob.last_zscore[1] < 0.0:
+        if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id and self.prob_event_speaker_token_id != self.user_speaker_token_id:
             external_pos_ranges = self._coordinated_generate_text()
         self._complete_or_rollback_generate(text_start_pos, text_start_n_tokens, external_pos_ranges)
         # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
@@ -437,22 +438,31 @@ class RealtimeAgent:
         text = text.strip()
         return text
 
-    def measure_event_probs(self):
+    def measure_event_prob(self):
         logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
         probs = softmax(logits)
         end_audio_prob = probs[self.end_audio_token_id]
+        self.stats.event_prob.add_value(end_audio_prob.item())
+
+        if self.stats.event_prob.last_zscore >= 0.0:
+            self.prob_event_speaker_token_id = self.get_probable_event_speaker()
+        else:
+            self.prob_event_speaker_token_id = None
+        
+    def get_probable_event_speaker(self) -> int:
         _ = next(self.resources.llm.generate([self.end_audio_token_id], reset=False))
         logits = np.ctypeslib.as_array(self.resources.llm._ctx.get_logits(), shape=(self.resources.llm._n_vocab,))
         probs = softmax(logits)
-        event_probs = probs[[self.agent_speaker_token_id, self.user_speaker_token_id]] * end_audio_prob
-        self.stats.event_prob.add_value(event_probs)
+        agent_prob, user_prob = probs[[self.agent_speaker_token_id, self.user_speaker_token_id]]
+        event_speaker = self.agent_speaker_token_id if agent_prob > user_prob else self.user_speaker_token_id
         self.resources.llm.n_tokens -= 1
+        return event_speaker
 
     def update_inactivity_timers(self) -> None:
         prev_ch2_abs_max_zscore = self.stats.ch_abs_max.last_zscore[1]
         self.stats.ch_abs_max.add_value((
-            np.abs(self.audio_history_ch1[-1]).max(), 
-            np.abs(self.audio_history_ch2[-1]).max(),
+            np.abs(self.audio_history_ch1[-1]).max().item(), 
+            np.abs(self.audio_history_ch2[-1]).max().item(),
         ))
         
         # channel 2 (input)
@@ -472,7 +482,9 @@ class RealtimeAgent:
     def should_force_transcription(self) -> bool:
         if self.config.force_trans_after_inactivity_secs == 0.0:
             return False
-        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs and self.stats.event_prob.last_zscore[1] >= 1.0
+        return self.ch2_inactivity_elapsed_secs >= self.config.force_trans_after_inactivity_secs \
+            and self.stats.event_prob.last_zscore >= 1.0 \
+            and self.prob_event_speaker_token_id == self.user_speaker_token_id
     
     def should_force_response(self) -> bool:
         if self.config.force_response_after_inactivity_secs == 0.0:
@@ -515,7 +527,7 @@ class RealtimeAgent:
             self.audio_history_ch2.append(audio_chunk)
 
             # Update stats and timers
-            self.measure_event_probs()
+            self.measure_event_prob()
             self.update_inactivity_timers()
 
             # Sanity check - output size
