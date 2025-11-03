@@ -7,22 +7,20 @@ import argparse
 import os
 import json
 
-from realtime_codec_agent import RealtimeAgentMultiprocessing, add_common_inference_args
+from realtime_codec_agent import RealtimeAgentSelfPlay, RealtimeAgentResources, add_common_inference_args
 from realtime_codec_agent.external_llm_client import ExternalLLMClient
 
 class AgentHandler(StreamHandler):
-    def __init__(self, agent_1: RealtimeAgentMultiprocessing, agent_2: RealtimeAgentMultiprocessing):
-        self.agent_1 = agent_1
-        self.agent_2 = agent_2
+    def __init__(self, self_play: RealtimeAgentSelfPlay):
+        self.self_play = self_play
         self.started = False
-        self.initial_chunk = True
         self.last_realtime_factor = None
 
-        agent_info_1 = self.agent_1.get_info()
-        self.chunk_size_samples = agent_info_1.chunk_size_samples
+        agent = self.self_play.agent_1
+        self.chunk_size_samples = agent.chunk_size_samples
         super().__init__(
-            input_sample_rate=agent_info_1.sampling_rate,
-            output_sample_rate=agent_info_1.sampling_rate,
+            input_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
+            output_sample_rate=agent.resources.audio_tokenizer.sampling_rate,
         )
 
     def receive(self, frame: tuple[int, np.ndarray]) -> None:
@@ -32,23 +30,14 @@ class AgentHandler(StreamHandler):
         if not self.started:
             return None
         #get the next output
-        if self.initial_chunk:
-            out_chunk_1 = out_chunk_2 = np.zeros(self.chunk_size_samples, dtype=np.float32)
-            realtime_factor_1 = realtime_factor_2 = None
-            self.initial_chunk = False
-        else:
-            out_chunk_1, realtime_factor_1 = self.agent_1.next_output(block=True)
-            out_chunk_2, realtime_factor_2 = self.agent_2.next_output(block=True)
-        out_chunk = np.vstack((out_chunk_1, out_chunk_2)).mean(axis=0, keepdims=True)
+        out_chunk = self.self_play.next_chunk()
+        out_chunk = out_chunk.mean(axis=0, keepdims=True)
         out_chunk = (out_chunk * 32767.0).astype(np.int16)
         print(f'Data from model:{out_chunk.shape, out_chunk.dtype, out_chunk.min(), out_chunk.max()}')
 
-        #queue up the next input
-        self.agent_1.queue_input(out_chunk_2)
-        self.agent_2.queue_input(out_chunk_1)
-
         # Report if realtime factor has changed
-        realtime_factor = min(realtime_factor_1 or 0.0, realtime_factor_2 or 0.0)
+        realtime_factor = self.self_play.agent_1.profilers.total_profiler.realtime_factor_values[-1] \
+            if self.self_play.agent_1.profilers.total_profiler.realtime_factor_values else None
         if realtime_factor != self.last_realtime_factor:
             self.last_realtime_factor = realtime_factor
             return (self.output_sample_rate, out_chunk), AdditionalOutputs(f"{realtime_factor:.2f}x")
@@ -56,33 +45,36 @@ class AgentHandler(StreamHandler):
         return (self.output_sample_rate, out_chunk)
 
     def copy(self):
-        return AgentHandler(self.agent_1, self.agent_2)
+        return AgentHandler(self.self_play)
 
     def shutdown(self):
         if not self.started:
             print(">>> Not Started <<<")
             return
-        for i, agent in enumerate([self.agent_1, self.agent_2]):
-            agent_info = agent.get_info()
+        for i, agent in enumerate([self.self_play.agent_1, self.self_play.agent_2]):
+            transcript = agent.format_transcript()
+            sequence = agent.get_sequence_str()
+            external_llm_messages = agent.get_external_llm_messages()
+            audio_history = agent.get_audio_history()
             os.makedirs("recordings", exist_ok=True)
             with open(f"recordings/output_self_play_agent_{i+1}.txt", "w", encoding="utf-8") as f:
                 f.write("---------------------------------------------------------------------------------------\n")
                 f.write("-- Transcript:\n")
                 f.write("---------------------------------------------------------------------------------------\n")
-                f.write(agent_info.transcript)
+                f.write(transcript)
                 f.write("\n\n")
                 f.write("---------------------------------------------------------------------------------------\n")
                 f.write("-- Sequence:\n")
                 f.write("---------------------------------------------------------------------------------------\n")
-                f.write(agent_info.sequence)
+                f.write(sequence)
                 f.write("\n\n")
-                if agent_info.config.use_external_llm:
+                if external_llm_messages is not None:
                     f.write("---------------------------------------------------------------------------------------\n")
                     f.write("-- External LLM Messages:\n")
                     f.write("---------------------------------------------------------------------------------------\n")
-                    f.write(json.dumps(agent_info.external_llm_messages, indent=4))
+                    f.write(json.dumps(external_llm_messages, indent=4))
                     f.write("\n\n")
-            audio_history = (agent_info.audio_history * 32767.0).astype(np.int16)
+            audio_history = (audio_history * 32767.0).astype(np.int16)
             sf.write(f"recordings/output_self_play_agent_{i+1}.wav", audio_history.T, self.output_sample_rate)
         
         self.started = False
@@ -90,19 +82,16 @@ class AgentHandler(StreamHandler):
 
     def start_up(self) -> None:
         self.set_config_and_reset()
-        agent_info_1 = self.agent_1.get_info()
-        self.chunk_size_samples = agent_info_1.chunk_size_samples
-        self.initial_chunk = True
-        self.last_realtime_factor = None
+        self.chunk_size_samples = self.self_play.agent_1.chunk_size_samples
         self.started = True
+        self.last_realtime_factor = None
         print(">>> Started <<<")
 
     def set_config_and_reset(self):
         if not self.phone_mode:
             self.wait_for_args_sync()
-            for i, agent in enumerate([self.agent_1, self.agent_2]):
-                agent_info = agent.get_info()
-                config = agent_info.config
+            for i, agent in enumerate([self.self_play.agent_1, self.self_play.agent_2]):
+                config = agent.config
                 config.agent_opening_text = self.latest_args[1 if i == 0 else 3]
                 config.agent_voice_enrollment = self.latest_args[2 if i == 0 else 4]
                 config.seed = int(self.latest_args[5]) if self.latest_args[5] else None
@@ -133,10 +122,9 @@ class AgentHandler(StreamHandler):
                 if config.agent_voice_enrollment is not None and config.agent_voice_enrollment[1].ndim == 2:
                     config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
 
-                agent.set_config_and_reset(config)
-        else:
-            self.agent_1.reset()
-            self.agent_2.reset()
+                agent.set_config(config)
+
+        self.self_play.reset()
 
 def display_handler(component1, realtime_factor: str):
     return realtime_factor
@@ -145,22 +133,14 @@ def main(args):
     print(f"Running with args: {args}")
     logging.basicConfig(level=logging.INFO)
 
-    agent_1 = RealtimeAgentMultiprocessing(
-        llm_model_path=args.llm_model_path,
-        wait_until_running=False,
+    self_play = RealtimeAgentSelfPlay(
+        resources=RealtimeAgentResources(llm_model_path=args.llm_model_path),
     )
-    agent_2 = RealtimeAgentMultiprocessing(
-        llm_model_path=args.llm_model_path,
-        wait_until_running=False,
-    )
-    agent_1.wait_until_running()
-    agent_2.wait_until_running()
 
-    agent_info_1 = agent_1.get_info()
-    config = agent_info_1.config
+    config = self_play.agent_1.config
     external_llm_models = ExternalLLMClient.get_models(config.external_llm_api_key, config.external_llm_base_url)
     external_llm_model = external_llm_models[0].split("/")[-1] if len(external_llm_models) > 0 else None
-    handler = AgentHandler(agent_1, agent_2)
+    handler = AgentHandler(self_play)
     stream = Stream(
         handler=handler,
         track_constraints = {

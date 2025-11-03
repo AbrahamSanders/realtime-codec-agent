@@ -324,10 +324,12 @@ class RealtimeAgent:
 
     def process_audio_input_ids(
         self, 
-        audio_chunk_input_ids: List[int], 
+        audio_chunk_input_ids: Optional[List[int]] = None, 
         force_trans: bool = False, 
         force_response: bool = False, 
     ) -> List[int]:
+        if audio_chunk_input_ids is None:
+            audio_chunk_input_ids = [None]
         out_chunk_input_ids = [0] * len(audio_chunk_input_ids)
         for i in range(len(audio_chunk_input_ids)):
             # trim the sequences to the maximum length
@@ -346,8 +348,11 @@ class RealtimeAgent:
                 self.input_ids.append(next_token)
                 # if next token is an audio token, append the next input (user) audio token
                 if next_token > self.end_header_token_id:
-                    self.input_ids.append(audio_chunk_input_ids[i])
-                    self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
+                    if audio_chunk_input_ids[i] is not None:
+                        self.input_ids.append(audio_chunk_input_ids[i])
+                        self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
+                    else:
+                        self.audio_tokens_idx.append(len(self.input_ids)-1)
                     out_chunk_input_ids[i] = next_token
                     break # move on to next input token
                 # if the previous token was end_audio_token and next token is *not* the agent speaker token, do transcription
@@ -506,28 +511,7 @@ class RealtimeAgent:
                 out_chunk_input_ids = self.process_tts_input_ids(tts_chunk_input_ids, out_chunk_input_ids)
 
             # Decode input ids to audio chunk and append to the audio history
-            with self.profilers.detokenize_profiler:
-                out_chunk_str = self.resources.tokenizer.decode(out_chunk_input_ids, skip_special_tokens=False)
-            with self.profilers.audio_detokenize_profiler:
-                (_, out_chunk), _, preroll_samples = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str, preroll_samples=self.crossfade_ramps[0])
-            out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
-            if self.config.target_volume_rms > 0:
-                out_chunk = normalize_audio_rms(out_chunk, target_rms=self.config.target_volume_rms)
-            if len(self.audio_history_ch1) > 0:
-                joined_ch1_chunks = smooth_join(self.audio_history_ch1[-1], out_chunk, *self.crossfade_ramps)
-                # sanity check - joined size
-                assert joined_ch1_chunks.shape[-1] == 2 * self.chunk_size_samples, \
-                    f"joined_ch1_chunks must have length {2 * self.chunk_size_samples}, but got {joined_ch1_chunks.shape[-1]}"
-                self.audio_history_ch1[-1] = joined_ch1_chunks[:self.chunk_size_samples]
-                self.audio_history_ch1.append(joined_ch1_chunks[self.chunk_size_samples:])
-                # Emit the output chunk from the audio history, shifted left by chunk_fade_secs.
-                # This is done because the smooth join (crossfade) modifies the tail of the previous chunk.
-                # So, we include the tail of the previous chunk in the output and exclude the tail of the current chunk.
-                out_chunk = joined_ch1_chunks[-self.chunk_size_samples-self.crossfade_ramps[0]:-self.crossfade_ramps[0]]
-            else:
-                self.audio_history_ch1.append(out_chunk)
-                # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
-                out_chunk = pad_or_trim(out_chunk[:-self.crossfade_ramps[0]], self.chunk_size_samples, pad_side="left")
+            out_chunk = self.detokenize_output_chunk(out_chunk_input_ids)
             self.audio_history_ch2.append(audio_chunk)
 
             # Update stats and timers
@@ -538,6 +522,31 @@ class RealtimeAgent:
             assert out_chunk.shape[-1] == self.chunk_size_samples, \
                 f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}"
             return out_chunk
+
+    def detokenize_output_chunk(self, out_chunk_input_ids: List[int]) -> np.ndarray:
+        with self.profilers.detokenize_profiler:
+            out_chunk_str = self.resources.tokenizer.decode(out_chunk_input_ids, skip_special_tokens=False)
+        with self.profilers.audio_detokenize_profiler:
+            (_, out_chunk), _, preroll_samples = self.resources.audio_tokenizer.detokenize_audio(out_chunk_str, preroll_samples=self.crossfade_ramps[0])
+        out_chunk = pad_or_trim(out_chunk, self.chunk_size_samples + preroll_samples)
+        if self.config.target_volume_rms > 0:
+            out_chunk = normalize_audio_rms(out_chunk, target_rms=self.config.target_volume_rms)
+        if len(self.audio_history_ch1) > 0:
+            joined_ch1_chunks = smooth_join(self.audio_history_ch1[-1], out_chunk, *self.crossfade_ramps)
+            # sanity check - joined size
+            assert joined_ch1_chunks.shape[-1] == 2 * self.chunk_size_samples, \
+                f"joined_ch1_chunks must have length {2 * self.chunk_size_samples}, but got {joined_ch1_chunks.shape[-1]}"
+            self.audio_history_ch1[-1] = joined_ch1_chunks[:self.chunk_size_samples]
+            self.audio_history_ch1.append(joined_ch1_chunks[self.chunk_size_samples:])
+            # Emit the output chunk from the audio history, shifted left by chunk_fade_secs.
+            # This is done because the smooth join (crossfade) modifies the tail of the previous chunk.
+            # So, we include the tail of the previous chunk in the output and exclude the tail of the current chunk.
+            out_chunk = joined_ch1_chunks[-self.chunk_size_samples-self.crossfade_ramps[0]:-self.crossfade_ramps[0]]
+        else:
+            self.audio_history_ch1.append(out_chunk)
+            # In case of the first chunk there will be no previous chunk tail so pad it on the left with zeros
+            out_chunk = pad_or_trim(out_chunk[:-self.crossfade_ramps[0]], self.chunk_size_samples, pad_side="left")
+        return out_chunk
 
     def update_transcript(self, text_start_pos: int, external_pos_ranges: List[Tuple[int, int]] = []) -> None:
         if text_start_pos is None:
@@ -736,7 +745,7 @@ class RealtimeAgent:
         formatted_transcript = "\n".join(formatted_lines)
         return formatted_transcript
     
-    def get_external_llm_messages(self):
+    def get_external_llm_messages(self) -> List[Dict[str, str]]:
         if self.llm_client is None:
             return None
         return self.llm_client.get_messages(self.transcript, self.config.external_llm_instructions)

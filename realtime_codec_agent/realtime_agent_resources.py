@@ -33,7 +33,17 @@ class RealtimeAgentResources:
         )
         self.tokenizer = AutoTokenizer.from_pretrained(self.llm_model_dir)
         self.audio_tokenizer = AudioTokenizer(codec_model=codec_model, device=codec_device)
-        self.whisper_model = whisper_model
-        if self.whisper_model is not None:
+        if isinstance(whisper_model, str):
             from pywhispercpp.model import Model
-            self.whisper_model = Model(self.whisper_model)
+            whisper_model = Model(whisper_model)
+        self.whisper_model = whisper_model
+
+    def clone_for_self_play(self) -> "RealtimeAgentResources":
+        """Make a copy of this RealtimeAgentResources instance sharing all resources except for the LLM, which is created as a new instance."""
+        return RealtimeAgentResources(
+            llm_model_path=self.llm.model_path,
+            llm_n_ctx=self.llm.n_ctx(),
+            codec_model=self.audio_tokenizer.codec_model,
+            codec_device=self.audio_tokenizer.device,
+            whisper_model=self.whisper_model,
+        )

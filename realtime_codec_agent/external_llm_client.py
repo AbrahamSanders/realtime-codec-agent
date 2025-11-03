@@ -37,7 +37,7 @@ class ExternalLLMClient:
         self.stream = None
         self.stream_read_count = 0
 
-    def get_messages(self, transcript: List[Dict[str, Any]], additional_instructions: str) -> List[Dict[str, Any]]:
+    def get_messages(self, transcript: List[Dict[str, Any]], additional_instructions: str) -> List[Dict[str, str]]:
         additional_instructions = f"\n\n## Instructions:\n{additional_instructions}" if additional_instructions else ""
         allow_laughter_instr = " and laughter (e.g. [laughing], [laughs] or &=laughing, &=laughs)" if self.allow_laughter else ""
         messages = [
