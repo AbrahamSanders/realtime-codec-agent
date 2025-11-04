@@ -24,6 +24,8 @@ class RealtimeAgentConfig:
     trim_by_secs: float = 20.0
     target_volume_rms: float = 0.0
     force_response_after_inactivity_secs: float = 3.0
+    finalize_response_after_inactivity_secs: float = 3.0
+    finalize_response_improbable_token_tolerance: int = 3
     seed: Optional[int] = 42
     header_audio_first_token: str = "<|audio_first|>"
     header_text_only_token: str = "<|text_only|>"

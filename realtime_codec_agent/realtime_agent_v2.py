@@ -470,6 +470,7 @@ class RealtimeAgent:
         return event_speaker
 
     def update_inactivity_timers(self) -> None:
+        prev_ch1_inactivity_elapsed_secs = self.ch1_inactivity_elapsed_secs
         prev_ch2_abs_max_zscore = self.stats.ch_abs_max.last_zscore[1]
         self.stats.ch_abs_max.add_value((
             np.abs(self.audio_history_ch1[-1]).max().item(), 
@@ -489,6 +490,8 @@ class RealtimeAgent:
             self.ch1_inactivity_elapsed_secs = 0.0
         else:
             self.ch1_inactivity_elapsed_secs += self.config.chunk_size_secs
+            if prev_ch1_inactivity_elapsed_secs < self.config.finalize_response_after_inactivity_secs <= self.ch1_inactivity_elapsed_secs:
+                self.finalize_last_response()
 
     def should_force_transcription(self) -> bool:
         if self.config.force_trans_after_inactivity_secs == 0.0:
@@ -618,11 +621,11 @@ class RealtimeAgent:
             return
         last_response["planned_text"] = last_response["text"]
         last_response_start_secs = last_response["start_secs"]
-        last_response_end_secs = min(self.total_secs - self.ch1_inactivity_elapsed_secs, last_response_start_secs + 10.0)
-        if last_response_end_secs <= last_response_start_secs:
+        last_response_end_secs = max(last_response_start_secs, self.total_secs - self.ch1_inactivity_elapsed_secs)
+        last_response["end_secs"] = last_response_end_secs
+        if last_response_end_secs == last_response_start_secs:
             # TODO: no response audio - response should be removed from transcript?
             return
-        last_response["end_secs"] = last_response_end_secs
         last_response_audio_input_ids = self.get_audio_tokens(last_response_start_secs, last_response_end_secs)
         c = self.config
         af_ctx_prompt = "".join([
@@ -655,14 +658,13 @@ class RealtimeAgent:
         to_probs = np.exp(self.resources.aux_llm.get_logprobs(to_ctx_input_ids, txt_input_ids))
         probs_ratio = af_probs / to_probs
 
-        tol = 2
         counter = 0
         for i, ratio in enumerate(probs_ratio):
             if ratio >= 1.0:
                 counter = 0
             else:
                 counter += 1
-            if counter > tol:
+            if counter > self.config.finalize_response_improbable_token_tolerance:
                 i -= counter
                 break
         final_text_input_ids = txt_input_ids[:i+1]
@@ -670,8 +672,6 @@ class RealtimeAgent:
             return
         elif len(final_text_input_ids) == 0:
             final_text_input_ids = self.resources.tokenizer.encode(" [silence]", add_special_tokens=False)
-        # else:
-        #     final_text_input_ids.append(self.resources.tokenizer.encode("-", add_special_tokens=False)[0])
         last_response["text"] = self.resources.tokenizer.decode(final_text_input_ids, skip_special_tokens=False).lstrip()
         # update sequence
         text_start_pos = last_response["text_start_pos"] + 2
