@@ -1,7 +1,27 @@
 from llama_cpp import Llama, LogitsProcessorList, StoppingCriteriaList, LlamaGrammar
-from typing import Sequence, Optional, Generator
+from typing import Sequence, Optional, Generator, Dict
 import sys
 import ctypes
+import numpy as np
+import numpy.typing as npt
+
+def get_logits_bias_processor(logit_bias: Dict[int, float]):
+    # Adapted from:
+    # https://github.com/abetlen/llama-cpp-python/blob/c37132bac860fcc333255c36313f89c4f49d4c8d/llama_cpp/llama.py#L1249
+    logit_bias_map = {int(k): float(v) for k, v in logit_bias.items()}
+
+    def logit_bias_processor(
+        input_ids: npt.NDArray[np.intc],
+        scores: npt.NDArray[np.single],
+    ) -> npt.NDArray[np.single]:
+        new_scores = np.copy(
+            scores
+        )  # Does it make sense to copy the whole array or can we just overwrite the original one?
+        for input_id, score in logit_bias_map.items():
+            new_scores[input_id] = score + scores[input_id]
+        return new_scores
+
+    return LogitsProcessorList([logit_bias_processor])
 
 class LlamaForAlternatingCodeChannels(Llama):
     def __init__(self, *args, **kwargs):

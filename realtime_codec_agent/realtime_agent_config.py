@@ -38,7 +38,7 @@ class RealtimeAgentConfig:
     external_llm_api_key: Optional[str] = "empty"
     external_llm_base_url: Optional[str] = "http://localhost:8080/v1"
     external_llm_model: Optional[str] = None
-    external_llm_top_p: float = 0.9
+    external_llm_top_p: float = 0.95
     external_llm_instructions: Optional[str] = None
     use_external_tts: bool = False
     external_tts_server_url: str = "http://localhost:8001"

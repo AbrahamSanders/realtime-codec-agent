@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Union, Optional, List, Dict, Any, Tuple, Set
 
 from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim, normalize_audio_rms
+from .utils.llamacpp_utils import get_logits_bias_processor
 from .realtime_agent_resources import RealtimeAgentResources
 from .realtime_agent_config import RealtimeAgentConfig
 from .realtime_agent_stats import RealtimeAgentStatsCollection
@@ -167,8 +168,9 @@ class RealtimeAgent:
         self.stats = RealtimeAgentStatsCollection(self.config)
         self.profilers = RealtimeAgentProfilerCollection(self.config)
 
-    def set_sampler(self, for_trans: bool = False) -> None:
+    def set_sampler(self, for_trans: bool = False, suppress_end_audio: bool = False) -> None:
         c = self.config
+        logits_processor = get_logits_bias_processor({self.end_audio_token_id: -100}) if suppress_end_audio else None
         self.resources.llm.init_sampler_for_generate(
             top_k=c.top_k,
             top_p=c.top_p,
@@ -177,6 +179,7 @@ class RealtimeAgent:
             repeat_penalty=c.repeat_penalty,
             presence_penalty=c.presence_penalty,
             frequency_penalty=c.frequency_penalty,
+            logits_processor=logits_processor,
             seed=c.seed,
         )
 
@@ -263,7 +266,7 @@ class RealtimeAgent:
             self.update_transcript(text_start_pos-1, external_pos_ranges)
             return True
 
-    def generate_for_trans(self) -> None:
+    def generate_for_trans(self) -> bool:
         assert self.input_ids[-2] == self.end_audio_token_id and self.input_ids[-1] != self.agent_speaker_token_id, \
             "generate_for_trans can only be called if self.input_ids ends with end_audio_token_id followed by a non-agent speaker id."
         # Record state at start in case we need to undo (e.g. if transcription is suppressed)
@@ -301,8 +304,9 @@ class RealtimeAgent:
             # since the transcription was suppressed, the transcription probability could still be high.
             # reset the channel 2 inactivity timer to avoid immediate forced transcription again.
             self.ch2_inactivity_elapsed_secs = 0.0
+        return completed
 
-    def generate_for_response(self) -> None:
+    def generate_for_response(self) -> bool:
         assert self.input_ids[-2] == self.end_audio_token_id and self.input_ids[-1] == self.agent_speaker_token_id, \
             "generate_for_response can only be called if self.input_ids ends with end_audio_token_id followed by the agent speaker id."
         self.finalize_last_response()
@@ -318,10 +322,11 @@ class RealtimeAgent:
         external_pos_ranges = []
         if self.config.use_external_llm and self.input_ids[-1] != self.start_audio_token_id and self.prob_event_speaker_token_id != self.user_speaker_token_id:
             external_pos_ranges = self._coordinated_generate_text()
-        self._complete_or_rollback_generate(text_start_pos, text_start_n_tokens, external_pos_ranges)
+        completed = self._complete_or_rollback_generate(text_start_pos, text_start_n_tokens, external_pos_ranges)
         # the model has the intent to respond, so reset channel 1 inactivity timer even though its audio hasn't been generated yet.
         # this prevents duplicate responses when self.config.force_response_after_inactivity_secs > 0.0.
         self.ch1_inactivity_elapsed_secs = 0.0
+        return completed
 
     def process_audio_input_ids(
         self, 
@@ -335,6 +340,7 @@ class RealtimeAgent:
         for i in range(len(audio_chunk_input_ids)):
             # trim the sequences to the maximum length
             self.trim_sequences()
+            suppress_end_audio = False
             while True:
                 # predict next token
                 audio_mode = all([t > self.end_header_token_id for t in self.input_ids[-2:]])
@@ -345,7 +351,12 @@ class RealtimeAgent:
                     force_trans = force_response = False
                 else:
                     last_n = 2 if audio_mode else 1
+                    if suppress_end_audio:
+                        self.set_sampler(suppress_end_audio=True)
                     next_token = next(self.resources.llm.generate(self.input_ids[-last_n:], reset=False))
+                    if suppress_end_audio:
+                        self.set_sampler()
+                        suppress_end_audio = False
                 self.input_ids.append(next_token)
                 # if next token is an audio token, append the next input (user) audio token
                 if next_token > self.end_header_token_id:
@@ -358,10 +369,10 @@ class RealtimeAgent:
                     break # move on to next input token
                 # if the previous token was end_audio_token and next token is *not* the agent speaker token, do transcription
                 elif self.input_ids[-2] == self.end_audio_token_id and next_token != self.agent_speaker_token_id:
-                    self.generate_for_trans()
+                    suppress_end_audio = not self.generate_for_trans()
                 # if the previous token was end_audio_token and next token *is* the agent speaker token, do response generation
                 elif self.input_ids[-2] == self.end_audio_token_id and next_token == self.agent_speaker_token_id:
-                    self.generate_for_response()
+                    suppress_end_audio = not self.generate_for_response()
         return out_chunk_input_ids
     
     def process_tts_input_ids(
@@ -393,7 +404,7 @@ class RealtimeAgent:
         if self.resources.whisper_model is None:
             raise ValueError("Whisper model is not loaded.")
         last_trans = self.last_transcription
-        trans_audio_start_secs = last_trans["end_secs"] + self.config.chunk_size_secs if last_trans is not None else 0.0
+        trans_audio_start_secs = last_trans["end_secs"] if last_trans is not None else 0.0
         trans_audio_start_samples = int(trans_audio_start_secs * self.resources.audio_tokenizer.sampling_rate)
         trans_audio_start_chunks, rem_samples = divmod(trans_audio_start_samples, self.chunk_size_samples)
         trans_audio = np.concatenate(self.audio_history_ch2[trans_audio_start_chunks:])[rem_samples:]
