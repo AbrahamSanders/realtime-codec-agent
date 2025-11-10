@@ -1,6 +1,5 @@
 from .realtime_agent_resources import RealtimeAgentResources
 from .realtime_agent_config import RealtimeAgentConfig
 from .realtime_agent_v2 import RealtimeAgent, RealtimeAgentMultiprocessing
-from .realtime_agent_self_play import RealtimeAgentSelfPlay
 
 from .utils.cli_utils import add_common_inference_args

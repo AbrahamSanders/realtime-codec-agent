@@ -27,7 +27,7 @@ class RealtimeAgentProfiler:
             raise ValueError("Chunk start time not set. Call log_chunk_start() before log_chunk_end().")
         chunk_end = datetime.now()
         elapsed_secs = (chunk_end - self.chunk_start).total_seconds()
-        self.realtime_factor_sum += self.config.chunk_size_secs / elapsed_secs
+        self.realtime_factor_sum += self.config.chunk_size_secs / (elapsed_secs + 1e-8)
         self.report_chunk_count += 1
         self.chunk_start = None
 

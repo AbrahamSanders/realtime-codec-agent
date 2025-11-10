@@ -15,7 +15,7 @@ from .realtime_agent_stats import RealtimeAgentStatsCollection
 from .realtime_agent_profiler import RealtimeAgentProfilerCollection
 
 class RealtimeAgent:
-    def __init__(self, resources: RealtimeAgentResources = None, config: RealtimeAgentConfig = None):
+    def __init__(self, resources: RealtimeAgentResources = None, config: RealtimeAgentConfig = None, self_play_mode: bool = False):
         if resources is None:
             resources = RealtimeAgentResources()
         self.resources = resources
@@ -26,6 +26,7 @@ class RealtimeAgent:
             config = RealtimeAgentConfig()
         self.set_config(config)
 
+        self.self_play_mode = self_play_mode
         self.transcript_regex = re.compile("([A-Z]):(.*?)(?= [A-Z]:|$)")
         # Regex for constraining text generation to paralinguistics only (e.g. [laughing], &=laughs) when using external 
         # asr / llm instead of native transcription / response generation. Matches here indicate that generation should 
@@ -330,12 +331,10 @@ class RealtimeAgent:
 
     def process_audio_input_ids(
         self, 
-        audio_chunk_input_ids: Optional[List[int]] = None, 
+        audio_chunk_input_ids: List[int], 
         force_trans: bool = False, 
         force_response: bool = False, 
     ) -> List[int]:
-        if audio_chunk_input_ids is None:
-            audio_chunk_input_ids = [None]
         out_chunk_input_ids = [0] * len(audio_chunk_input_ids)
         for i in range(len(audio_chunk_input_ids)):
             # trim the sequences to the maximum length
@@ -360,11 +359,8 @@ class RealtimeAgent:
                 self.input_ids.append(next_token)
                 # if next token is an audio token, append the next input (user) audio token
                 if next_token > self.end_header_token_id:
-                    if audio_chunk_input_ids[i] is not None:
-                        self.input_ids.append(audio_chunk_input_ids[i])
-                        self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
-                    else:
-                        self.audio_tokens_idx.append(len(self.input_ids)-1)
+                    self.input_ids.append(audio_chunk_input_ids[i])
+                    self.audio_tokens_idx.extend([len(self.input_ids)-2, len(self.input_ids)-1])
                     out_chunk_input_ids[i] = next_token
                     break # move on to next input token
                 # if the previous token was end_audio_token and next token is *not* the agent speaker token, do transcription
@@ -481,7 +477,7 @@ class RealtimeAgent:
         if self.stats.ch_abs_max.last_zscore[1] >= 0.0:
             self.ch2_inactivity_elapsed_secs = 0.0
             if prev_ch2_abs_max_zscore < 0.0:
-                self.ch2_activity_start_secs = self.total_secs
+                self.ch2_activity_start_secs = self.total_secs-self.config.chunk_size_secs
         else:
             self.ch2_inactivity_elapsed_secs += self.config.chunk_size_secs
         
@@ -505,18 +501,22 @@ class RealtimeAgent:
             return False
         return min(self.ch1_inactivity_elapsed_secs, self.ch2_inactivity_elapsed_secs) >= self.config.force_response_after_inactivity_secs
 
-    def process_audio(self, audio_chunk: np.ndarray) -> np.ndarray:
+    def process_audio(self, audio_chunk: np.ndarray, audio_chunk_input_ids: Optional[List[int]] = None) -> np.ndarray:
         with self.profilers.total_profiler:
             # Sanity check - input size
             assert audio_chunk.shape[-1] == self.chunk_size_samples, \
                 f"audio_chunk must have length {self.chunk_size_samples}, but got {audio_chunk.shape[-1]}"
+            assert audio_chunk_input_ids is None or len(audio_chunk_input_ids) == self.chunk_size_frames_per_channel, \
+                f"audio_chunk_input_ids must have length {self.chunk_size_frames_per_channel}, but got {len(audio_chunk_input_ids)}"
             tts_chunk_input_ids = None
 
             # Encode audio chunk to input ids
             with self.profilers.audio_tokenize_profiler:
-                audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)
+                if audio_chunk_input_ids is None:
+                    audio_chunk_str = self.resources.audio_tokenizer.tokenize_audio(audio_chunk)
             with self.profilers.tokenize_profiler:
-                audio_chunk_input_ids = self.resources.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
+                if audio_chunk_input_ids is None:
+                    audio_chunk_input_ids = self.resources.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
                 if self.config.use_external_tts and self.tts_interrupted_chunk_input_ids is not None:
                     tts_chunk_input_ids = self.tts_interrupted_chunk_input_ids
                 elif self.config.use_external_tts:
@@ -547,6 +547,10 @@ class RealtimeAgent:
             # Sanity check - output size
             assert out_chunk.shape[-1] == self.chunk_size_samples, \
                 f"out_chunk must have length {self.chunk_size_samples}, but got {out_chunk.shape[-1]}"
+            assert len(out_chunk_input_ids) == self.chunk_size_frames_per_channel, \
+                f"out_chunk_input_ids must have length {self.chunk_size_frames_per_channel}, but got {len(out_chunk_input_ids)}"
+            if self.self_play_mode:
+                return out_chunk, out_chunk_input_ids
             return out_chunk
 
     def detokenize_output_chunk(self, out_chunk_input_ids: List[int]) -> np.ndarray:
@@ -789,6 +793,8 @@ class RealtimeAgentMultiprocessing:
         self, 
         wait_until_running: bool = True,
         config: RealtimeAgentConfig = None,
+        self_play_mode: bool = False,
+        gpu_id: Optional[int] = None,
         idle_tol_secs: float = 1.0,
         **resources_kwargs,
     ):
@@ -807,7 +813,7 @@ class RealtimeAgentMultiprocessing:
         self.execute_process = ctx.Process(
             target=self.execute, 
             daemon=True, 
-            args=(config, idle_tol_secs),
+            args=(config, self_play_mode, gpu_id, idle_tol_secs),
             kwargs=resources_kwargs,
         )
         self.execute_process.start()
@@ -823,9 +829,12 @@ class RealtimeAgentMultiprocessing:
     def is_running(self):
         return self.running.value
 
-    def execute(self, config: RealtimeAgentConfig, idle_tol_secs: float, **resources_kwargs):
+    def execute(self, config: RealtimeAgentConfig, self_play_mode: bool, gpu_id: Optional[int], idle_tol_secs: float, **resources_kwargs):
+        if gpu_id is not None:
+            import os
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         agent_resources = RealtimeAgentResources(**resources_kwargs)
-        agent = RealtimeAgent(resources=agent_resources, config=config)
+        agent = RealtimeAgent(resources=agent_resources, config=config, self_play_mode=self_play_mode)
         last_input_time = datetime.now()
         is_idle = False
 
@@ -864,7 +873,9 @@ class RealtimeAgentMultiprocessing:
                 now = datetime.now()
                 if not self.input_queue.empty():
                     input_audio = self.input_queue.get()
-                    output_audio = agent.process_audio(input_audio)
+                    if isinstance(input_audio, np.ndarray):
+                        input_audio = (input_audio, None)
+                    output_audio = agent.process_audio(*input_audio)
                     realtime_factor = agent.profilers.total_profiler.realtime_factor_values[-1] \
                         if agent.profilers.total_profiler.realtime_factor_values else None
                     self.output_queue.put((output_audio, realtime_factor))

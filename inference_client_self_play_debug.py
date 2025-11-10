@@ -4,12 +4,13 @@ import numpy as np
 import argparse
 import logging
 
-from realtime_codec_agent import RealtimeAgentSelfPlay, RealtimeAgentResources, add_common_inference_args
+from realtime_codec_agent import RealtimeAgent, RealtimeAgentResources, add_common_inference_args
 from realtime_codec_agent.external_llm_client import ExternalLLMClient
 
 logger = logging.getLogger(__name__)
 
-self_play = None
+agent_1 = None
+agent_2 = None
 
 def set_config_and_reset(
     opening_text_1: str,
@@ -43,7 +44,7 @@ def set_config_and_reset(
     constrain_allow_laughter: bool,
     run_profilers: bool,
 ):
-    for i, agent in enumerate([self_play.agent_1, self_play.agent_2]):
+    for i, agent in enumerate([agent_1, agent_2]):
         config = agent.config
         config.agent_opening_text = opening_text_1 if i == 0 else opening_text_2
         config.agent_voice_enrollment = enrollment_audio_1 if i == 0 else enrollment_audio_2
@@ -76,8 +77,7 @@ def set_config_and_reset(
             config.agent_voice_enrollment = (config.agent_voice_enrollment[0], config.agent_voice_enrollment[1].T)
 
         agent.set_config(config)
-
-    self_play.reset()
+        agent.reset()
 
 def run_agent(
     duration_secs: float,
@@ -86,18 +86,21 @@ def run_agent(
 ):
     set_config_and_reset(*config_args)
     last_stream_secs = 0.0
-    while self_play.agent_1.total_secs < float(duration_secs):
-        _ = self_play.next_chunk()
-        if self_play.agent_1.total_secs >= float(duration_secs) or (stream_output and self_play.agent_1.total_secs - last_stream_secs >= 2.0):
+    out_chunk_1 = out_chunk_2 = (np.zeros(agent_1.chunk_size_samples, dtype=np.float32), None)
+    while agent_1.total_secs < float(duration_secs):
+        out_chunk_1_ = agent_1.process_audio(*out_chunk_2)
+        out_chunk_2 = agent_2.process_audio(*out_chunk_1)
+        out_chunk_1 = out_chunk_1_
+        if agent_1.total_secs >= float(duration_secs) or (stream_output and agent_1.total_secs - last_stream_secs >= 2.0):
             output = []
-            for agent in [self_play.agent_1, self_play.agent_2]:
+            for agent in [agent_1, agent_2]:
                 out_history = agent.get_audio_history()
                 transcript = agent.format_transcript()
                 sequence = agent.get_sequence_str()
                 external_llm_messages = agent.get_external_llm_messages()
                 output.extend([(agent.resources.audio_tokenizer.sampling_rate, out_history.T), transcript, sequence, external_llm_messages])
             yield output
-            last_stream_secs = self_play.agent_1.total_secs
+            last_stream_secs = agent_1.total_secs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run the Realtime Codec Agent Self Play debug interface.")
@@ -107,11 +110,16 @@ if __name__ == "__main__":
     print(f"Running with args: {args}")
     logging.basicConfig(level=logging.INFO)
 
-    self_play = RealtimeAgentSelfPlay(
+    agent_1 = RealtimeAgent(
         resources=RealtimeAgentResources(llm_model_path=args.llm_model_path),
+        self_play_mode=True,
+    )
+    agent_2 = RealtimeAgent(
+        resources=RealtimeAgentResources(llm_model_path=args.llm_model_path),
+        self_play_mode=True,
     )
 
-    config = self_play.agent_1.config
+    config = agent_1.config
     external_llm_models = ExternalLLMClient.get_models(config.external_llm_api_key, config.external_llm_base_url)
     external_llm_model = external_llm_models[0].split("/")[-1] if len(external_llm_models) > 0 else None
     interface = gr.Interface(
