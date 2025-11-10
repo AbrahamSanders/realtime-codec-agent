@@ -1,6 +1,6 @@
 # read in the checkpoint directory from the first command line argument
 CHECKPOINT_DIR=$1
-TEST_MODEL_DIR="Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test"
+TEST_MODEL_DIR="${CHECKPOINT_DIR}-test"
 
 # if Llama-3.2-1B-magicodec-no-bpe-multi-131k-stereo-test directory exists, remove it
 if [ -d $TEST_MODEL_DIR ]; then
